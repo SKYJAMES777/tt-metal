@@ -126,13 +126,13 @@ def test_update_padded_kv_cache_single_device(mesh_device, dtype, layout):
                 .to(torch.bfloat16)
                 .reshape(new_isl_global, KVPE_HEAD_DIM)
             )
+            metadata = _make_metadata_tensor(mesh_device, kv_actual_global=0, slot_idx=u)
             ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
                 kv_cache,
                 tt_input,
-                slot_idx=u,
+                metadata,
                 layer_idx=l,
                 num_layers=num_layers,
-                kv_actual_global=0,
                 cluster_axis=sp_axis,
             )
 
@@ -154,6 +154,22 @@ def test_update_padded_kv_cache_single_device(mesh_device, dtype, layout):
                 f"(max abs diff {(written.float() - expected[(u, l)].float()).abs().max().item()})"
             )
             logger.info(f"  [{dtype}] user {u} layer {l}: exact match")
+
+
+def _make_metadata_tensor(mesh_device, kv_actual_global, slot_idx):
+    """Replicate the post-h2d_socket_sync state: a small uint32 DRAM tensor, replicated
+    across the mesh, holding the runner's canonical metadata payload
+    [slot_id, actual_start, actual_end]. The op's writer kernel reads slot_idx from index 0
+    and kv_actual_global (= actual_start) from index 1 on-device (no host scalars)."""
+    payload = torch.tensor([slot_idx, kv_actual_global, kv_actual_global, 0], dtype=torch.int64).reshape(1, 1, 1, 4)
+    return ttnn.from_torch(
+        payload,
+        device=mesh_device,
+        dtype=ttnn.uint32,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+    )
 
 
 @pytest.mark.parametrize("mesh_device", [(1, 4), (2, 4), (8, 4)], ids=["1x4", "2x4", "8x4"], indirect=True)
@@ -243,13 +259,13 @@ def test_update_padded_kv_cache_single_iteration_prefill(
             )
             # Exact reference: the input read back in natural order (same encode/decode as the cache).
             expected[(u, l)] = ttnn.to_torch(tt_input, mesh_composer=composer).to(torch.bfloat16)[0, 0]
+            metadata = _make_metadata_tensor(mesh_device, kv_actual_global=0, slot_idx=u)
             ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
                 kv_cache,
                 tt_input,
-                slot_idx=u,
+                metadata,
                 layer_idx=l,
                 num_layers=num_layers,
-                kv_actual_global=0,
                 cluster_axis=sp_axis,
             )
 
@@ -452,13 +468,13 @@ def test_update_padded_kv_cache_multi_iteration_prefill(
                 # scatter its valid rows into the natural-order reference.
                 inp_rb = ttnn.to_torch(tt_input, mesh_composer=composer).to(torch.bfloat16)[0, 0]
                 expected[(u, l)][flat_t[valid_rows]] = inp_rb[valid_rows]
+                metadata = _make_metadata_tensor(mesh_device, kv_actual_global=kv_actual, slot_idx=u)
                 ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
                     kv_cache,
                     tt_input,
-                    slot_idx=u,
+                    metadata,
                     layer_idx=l,
                     num_layers=num_layers,
-                    kv_actual_global=kv_actual,
                     cluster_axis=sp_axis,
                 )
         kv_actual = valid_end
