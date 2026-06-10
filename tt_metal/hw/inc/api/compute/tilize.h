@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include "api/compute/common.h"
 #include "api/compute/sentinel/compute_kernel_sentinel.h"
 #ifdef TRISC_MATH
@@ -11,8 +12,8 @@
 #ifdef ARCH_BLACKHOLE
 #include "experimental/llk_math_fast_tilize_api.h"
 #endif
-#ifndef ARCH_QUASAR
 #include "llk_math_reduce_api.h"
+#ifndef ARCH_QUASAR
 #include "llk_math_matmul_api.h"
 #endif
 #endif
@@ -47,7 +48,8 @@ namespace ckernel {
  * | Function   | ocb    | Output circular buffer identifier        | uint32_t | 0 to 31     | True     |
  */
 // clang-format on
-ALWI void tilize_init(uint32_t icb, uint32_t block, uint32_t ocb, uint32_t call_line = __builtin_LINE()) {
+ALWI void tilize_init(
+    std::uint32_t icb, std::uint32_t block, std::uint32_t ocb, std::uint32_t call_line = __builtin_LINE()) {
 #ifndef ARCH_QUASAR
     state_configure<Operand::SRCA, Operand::PACK>(icb, ocb, call_line);
     UNPACK((llk_unpack_tilize_init(icb, block)));
@@ -69,7 +71,6 @@ ALWI void tilize_init(uint32_t icb, uint32_t block, uint32_t ocb, uint32_t call_
 #endif
 }
 
-#ifndef ARCH_QUASAR
 #if (defined(REDUCE_OP) and defined(REDUCE_DIM)) or defined(__DOXYGEN__)
 
 // clang-format off
@@ -93,8 +94,13 @@ ALWI void tilize_init(uint32_t icb, uint32_t block, uint32_t ocb, uint32_t call_
 // clang-format on
 template <bool neginf_srcA = true, bool zero_srcA_reduce = false>
 ALWI void tilizeA_B_reduce_init(
-    uint32_t icb0, uint32_t icb1_scaler, uint32_t block, uint32_t ocb, uint32_t call_line = __builtin_LINE()) {
+    std::uint32_t icb0,
+    std::uint32_t icb1_scaler,
+    std::uint32_t block,
+    std::uint32_t ocb,
+    std::uint32_t call_line = __builtin_LINE()) {
     state_configure(icb0, icb1_scaler, ocb, call_line);
+#ifndef ARCH_QUASAR
     UNPACK((llk_unpack_hw_configure<DST_ACCUM_MODE>(icb0, icb1_scaler)));
     UNPACK((llk_unpack_tilizeA_B_init<neginf_srcA, true /*reload_srcB*/, false /*zero_srcA*/, zero_srcA_reduce>(
         icb0, icb1_scaler, block)));
@@ -106,8 +112,22 @@ ALWI void tilizeA_B_reduce_init(
     PACK((llk_pack_hw_configure<DST_ACCUM_MODE>(ocb)));
     PACK((llk_pack_init(ocb)));
     PACK((llk_pack_dest_init<DST_ACCUM_MODE, PackMode::Default>(ocb)));
+#else
+    UNPACK((llk_unpack_hw_configure(icb0, icb1_scaler)));
+    UNPACK((llk_unpack_tilizeA_B_init<neginf_srcA, true /*reload_srcB*/, false /*zero_srcA*/, zero_srcA_reduce>(
+        icb0, icb1_scaler, block)));
+
+    MATH((llk_math_reduce_init<REDUCE_OP, REDUCE_DIM, DST_ACCUM_MODE, MATH_FIDELITY>(icb0, icb1_scaler)));
+    MATH((llk_math_pack_sync_init()));
+    MATH((llk_math_hw_configure<DST_ACCUM_MODE>(icb0, icb1_scaler)));
+
+    PACK((llk_pack_hw_configure(ocb)));
+    PACK((llk_pack_init(ocb)));
+    PACK((llk_pack_dest_init()));
+#endif
 }
 
+#ifndef ARCH_QUASAR
 // clang-format off
 /**
  * @deprecated Operand A unpack face geometry (num_faces, face_r_dim) is now read from circular-buffer metadata
@@ -134,13 +154,13 @@ template <bool neginf_srcA = true, bool zero_srcA_reduce = false>
     "Operand A unpack face geometry is now read from circular-buffer metadata; use the "
     "tilizeA_B_reduce_init(icb0, icb1_scaler, block, ocb) overload instead.")]] ALWI void
 tilizeA_B_reduce_init(
-    uint32_t icb0,
-    uint32_t icb1_scaler,
-    uint32_t block,
-    uint32_t ocb,
-    uint32_t num_faces,
-    uint32_t face_r_dim,
-    uint32_t call_line = __builtin_LINE()) {
+    std::uint32_t icb0,
+    std::uint32_t icb1_scaler,
+    std::uint32_t block,
+    std::uint32_t ocb,
+    std::uint32_t num_faces,
+    std::uint32_t face_r_dim,
+    std::uint32_t call_line = __builtin_LINE()) {
     state_configure(icb0, icb1_scaler, ocb, call_line);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -158,7 +178,9 @@ tilizeA_B_reduce_init(
     PACK((llk_pack_dest_init<DST_ACCUM_MODE, PackMode::Default>(ocb)));
 }
 #endif
+#endif  // (REDUCE_OP && REDUCE_DIM) || __DOXYGEN__
 
+#ifndef ARCH_QUASAR
 // clang-format off
 /**
  * Re-initializes the tilize operation and reconfigures the unpacker with CB data type.
@@ -173,7 +195,8 @@ tilizeA_B_reduce_init(
  * | Function   | ocb      | Output circular buffer identifier        | uint32_t | 0 to 31     | True     |
  */
 // clang-format on
-ALWI void tilize_init_short_with_dt(uint32_t old_icb, uint32_t new_icb, uint32_t block, uint32_t ocb) {
+ALWI void tilize_init_short_with_dt(
+    std::uint32_t old_icb, std::uint32_t new_icb, std::uint32_t block, std::uint32_t ocb) {
     MATH((llk_math_eltwise_unary_datacopy_init<
           DataCopyType::A2D,
           DST_ACCUM_MODE,
@@ -208,10 +231,14 @@ ALWI void tilize_init_short_with_dt(uint32_t old_icb, uint32_t new_icb, uint32_t
  */
 // clang-format on
 ALWI void tilize_block(
-    uint32_t icb, uint32_t block, uint32_t ocb, uint32_t input_tile_index = 0, uint32_t output_tile_index = 0) {
+    std::uint32_t icb,
+    std::uint32_t block,
+    std::uint32_t ocb,
+    std::uint32_t input_tile_index = 0,
+    std::uint32_t output_tile_index = 0) {
     UNPACK((llk_unpack_tilize_block(icb, block, input_tile_index)));
 
-    for (uint32_t t = 0; t < block; t++) {
+    for (std::uint32_t t = 0; t < block; t++) {
         // Acquire dst
         MATH((llk_math_wait_for_dest_available()));
         PACK((llk_packer_wait_for_math_done()));
@@ -230,8 +257,6 @@ ALWI void tilize_block(
         PACK((llk_pack_dest_section_done<DST_ACCUM_MODE>()));
     }
 }
-
-#ifndef ARCH_QUASAR
 
 // clang-format off
 /**
@@ -258,11 +283,13 @@ template <
     std::uint32_t reload_srcB = true,
     bool zero_srcA = false,
     bool zero_srcA_reduce = false>
-ALWI void unpack_tilizeA_B_block(uint32_t icb0, uint32_t icb1, uint32_t block, uint32_t tile_idx_b) {
+ALWI void unpack_tilizeA_B_block(
+    std::uint32_t icb0, std::uint32_t icb1, std::uint32_t block, std::uint32_t tile_idx_b) {
     UNPACK((llk_unpack_tilizeA_B_block<neginf_srcA, reload_srcB, zero_srcA, zero_srcA_reduce>(
         icb0, icb1, block, tile_idx_b)));
 }
 
+#ifndef ARCH_QUASAR
 // clang-format off
 /**
  * @deprecated Operand A face geometry (num_faces, srca_face_r_dim) is now read from circular-buffer unpack
@@ -294,13 +321,20 @@ template <
     "Operand A face geometry is now read from circular-buffer unpack metadata; use the "
     "unpack_tilizeA_B_block(icb0, icb1, block, tile_idx_b) overload instead.")]] ALWI void
 unpack_tilizeA_B_block(
-    uint32_t icb0, uint32_t icb1, uint32_t block, uint32_t tile_idx_b, uint32_t num_faces, uint32_t srca_face_r_dim) {
+    std::uint32_t icb0,
+    std::uint32_t icb1,
+    std::uint32_t block,
+    std::uint32_t tile_idx_b,
+    std::uint32_t num_faces,
+    std::uint32_t srca_face_r_dim) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     UNPACK((llk_unpack_tilizeA_B_block<neginf_srcA, reload_srcB, zero_srcA, zero_srcA_reduce>(
         icb0, icb1, block, tile_idx_b, num_faces, srca_face_r_dim)));
 #pragma GCC diagnostic pop
 }
+
+#endif  // !ARCH_QUASAR
 
 // clang-format off
 /**
@@ -318,13 +352,14 @@ unpack_tilizeA_B_block(
  */
 // clang-format on
 
-ALWI void tilize_uninit(uint32_t icb, uint32_t ocb) {
+ALWI void tilize_uninit(std::uint32_t icb, std::uint32_t ocb) {
     UNPACK((llk_unpack_tilize_uninit(icb)));
 #ifdef ARCH_BLACKHOLE
     PACK((llk_pack_init<PackMode::Default>(ocb)));
 #endif
 }
 
+#ifndef ARCH_QUASAR
 // clang-format off
 /**
  * Uninitializes the tilize operation and reconfigures the unpacker with CB data types.
@@ -341,7 +376,7 @@ ALWI void tilize_uninit(uint32_t icb, uint32_t ocb) {
  * | Function   | ocb      | Output circular buffer identifier        | uint32_t | 0 to 31     | True     |
  */
 // clang-format on
-ALWI void tilize_uninit_with_dt(uint32_t old_icb, uint32_t new_icb, uint32_t ocb) {
+ALWI void tilize_uninit_with_dt(std::uint32_t old_icb, std::uint32_t new_icb, std::uint32_t ocb) {
     UNPACK((llk_unpack_tilize_uninit(old_icb)));
     UNPACK((llk_unpack_reconfig_data_format_srca<DST_ACCUM_MODE, p_dim_stride_target::IGNORE>(old_icb, new_icb)));
     MATH((llk_math_reconfig_data_format_srca<DST_ACCUM_MODE>(old_icb, new_icb)));
@@ -353,7 +388,8 @@ ALWI void tilize_uninit_with_dt(uint32_t old_icb, uint32_t new_icb, uint32_t ocb
 namespace fast_tilize_detail {
 
 template <bool configure_remap>
-ALWI void fast_tilize_init_impl(uint32_t icb, uint32_t full_dim, uint32_t ocb, uint32_t call_line = __builtin_LINE()) {
+ALWI void fast_tilize_init_impl(
+    std::uint32_t icb, std::uint32_t full_dim, std::uint32_t ocb, std::uint32_t call_line = __builtin_LINE()) {
 #ifdef ARCH_BLACKHOLE
     if (full_dim == 1) {
         tilize_init(icb, full_dim, ocb, call_line);
@@ -365,7 +401,7 @@ ALWI void fast_tilize_init_impl(uint32_t icb, uint32_t full_dim, uint32_t ocb, u
 
 #ifdef ARCH_BLACKHOLE
     // first_chunk = decompose_row(full_dim)[0]: avoids first reinit_xdim in block loop.
-    uint32_t first_chunk = (full_dim > 5) ? 4 : (full_dim == 5) ? 2 : full_dim;
+    std::uint32_t first_chunk = (full_dim > 5) ? 4 : (full_dim == 5) ? 2 : full_dim;
     UNPACK((llk_unpack_fast_tilize_init(icb, full_dim, first_chunk)));
     if constexpr (configure_remap) {
         MATH((llk_math_fast_tilize_init(icb)));
@@ -382,19 +418,20 @@ ALWI void fast_tilize_init_impl(uint32_t icb, uint32_t full_dim, uint32_t ocb, u
 
 }  // namespace fast_tilize_detail
 
-ALWI void fast_tilize_init(uint32_t icb, uint32_t full_dim, uint32_t ocb, uint32_t call_line = __builtin_LINE()) {
+ALWI void fast_tilize_init(
+    std::uint32_t icb, std::uint32_t full_dim, std::uint32_t ocb, std::uint32_t call_line = __builtin_LINE()) {
     fast_tilize_detail::fast_tilize_init_impl<true>(icb, full_dim, ocb, call_line);
 }
 
 ALWI void fast_tilize_init_skip_remap(
-    uint32_t icb, uint32_t full_dim, uint32_t ocb, uint32_t call_line = __builtin_LINE()) {
+    std::uint32_t icb, std::uint32_t full_dim, std::uint32_t ocb, std::uint32_t call_line = __builtin_LINE()) {
     fast_tilize_detail::fast_tilize_init_impl<false>(icb, full_dim, ocb, call_line);
 }
 
 namespace fast_tilize_detail {
 
 template <bool configure_remap>
-ALWI void fast_tilize_init_with_dt_impl(uint32_t icb, uint32_t full_dim, uint32_t ocb) {
+ALWI void fast_tilize_init_with_dt_impl(std::uint32_t icb, std::uint32_t full_dim, std::uint32_t ocb) {
     // Reconfig both SrcA and SrcB to match WH: some activation-reuse call sites
     // leave SrcB in a prior matmul-weights config that's incompatible with the
     // fast-tilize path, producing garbage output.
@@ -406,15 +443,15 @@ ALWI void fast_tilize_init_with_dt_impl(uint32_t icb, uint32_t full_dim, uint32_
 
 }  // namespace fast_tilize_detail
 
-ALWI void fast_tilize_init_with_dt(uint32_t icb, uint32_t full_dim, uint32_t ocb) {
+ALWI void fast_tilize_init_with_dt(std::uint32_t icb, std::uint32_t full_dim, std::uint32_t ocb) {
     fast_tilize_detail::fast_tilize_init_with_dt_impl<true>(icb, full_dim, ocb);
 }
 
-ALWI void fast_tilize_init_with_dt_skip_remap(uint32_t icb, uint32_t full_dim, uint32_t ocb) {
+ALWI void fast_tilize_init_with_dt_skip_remap(std::uint32_t icb, std::uint32_t full_dim, std::uint32_t ocb) {
     fast_tilize_detail::fast_tilize_init_with_dt_impl<false>(icb, full_dim, ocb);
 }
 
-ALWI void fast_tilize_uninit(uint32_t icb, uint32_t ocb, uint32_t full_dim) {
+ALWI void fast_tilize_uninit(std::uint32_t icb, std::uint32_t ocb, std::uint32_t full_dim) {
 #ifdef ARCH_BLACKHOLE
     if (full_dim == 1) {
         tilize_uninit(icb, ocb);
@@ -428,7 +465,11 @@ ALWI void fast_tilize_uninit(uint32_t icb, uint32_t ocb, uint32_t full_dim) {
 }
 
 ALWI void fast_tilize_block(
-    uint32_t icb, uint32_t block, uint32_t ocb, uint32_t input_tile_index = 0, uint32_t output_tile_index = 0) {
+    std::uint32_t icb,
+    std::uint32_t block,
+    std::uint32_t ocb,
+    std::uint32_t input_tile_index = 0,
+    std::uint32_t output_tile_index = 0) {
 #ifdef ARCH_BLACKHOLE
     if (block == 1) {
         tilize_block(icb, block, ocb, input_tile_index, output_tile_index);
@@ -441,9 +482,9 @@ ALWI void fast_tilize_block(
     {
         input_tile_index = input_tile_index % block + (input_tile_index / block) * block * TILE_R_DIM;
 
-        uint32_t tiles_done = 0;
+        std::uint32_t tiles_done = 0;
         // Always program the current unit dim at block entry.
-        uint32_t prev_chunk = 0;
+        std::uint32_t prev_chunk = 0;
 
         PACK((llk_pack_fast_tilize_row_begin(ocb, output_tile_index)));
 
@@ -451,8 +492,8 @@ ALWI void fast_tilize_block(
             // BH fast-tilize MOP supports unit_dim 2, 3, 4 (not 1).
             // Avoid chunk=1 by splitting: remaining=5 → 2+3 instead of 4+1.
             // Matches LLK decompose_row order.
-            uint32_t remaining = block - tiles_done;
-            uint32_t chunk = (remaining > 5) ? 4 : (remaining == 5) ? 2 : remaining;
+            std::uint32_t remaining = block - tiles_done;
+            std::uint32_t chunk = (remaining > 5) ? 4 : (remaining == 5) ? 2 : remaining;
 
             MATH((llk_math_wait_for_dest_available()));
             PACK((llk_packer_wait_for_math_done()));
@@ -475,21 +516,21 @@ ALWI void fast_tilize_block(
         PACK((llk_pack_fast_tilize_row_end()));
     }
 #else
-    uint32_t full_dim = block;
+    std::uint32_t full_dim = block;
 
     // Not sure if input_tile_index can be arbitrary but it works for moving across rows of files,
     // i.e. input_tile_index % full_dim == 0
     input_tile_index = input_tile_index % full_dim + (input_tile_index / full_dim) * full_dim * TILE_R_DIM;
 
-    uint32_t packed_tiles = 0;
-    uint32_t remaining_tiles = block;
-    uint32_t dest_size = DST_ACCUM_MODE ? 4 : 8;
-    uint32_t unit_dim = full_dim == 1 ? 1 : 2;
-    uint32_t num_units = dest_size / unit_dim;
+    std::uint32_t packed_tiles = 0;
+    std::uint32_t remaining_tiles = block;
+    std::uint32_t dest_size = DST_ACCUM_MODE ? 4 : 8;
+    std::uint32_t unit_dim = full_dim == 1 ? 1 : 2;
+    std::uint32_t num_units = dest_size / unit_dim;
 
     while (packed_tiles < block) {
-        UNPACK(uint32_t read_tile_index = input_tile_index + packed_tiles);
-        PACK(uint32_t write_tile_index = output_tile_index + packed_tiles);
+        UNPACK(std::uint32_t read_tile_index = input_tile_index + packed_tiles);
+        PACK(std::uint32_t write_tile_index = output_tile_index + packed_tiles);
 
         MATH((llk_math_wait_for_dest_available()));
         PACK((llk_packer_wait_for_math_done()));
@@ -503,7 +544,7 @@ ALWI void fast_tilize_block(
             remaining_tiles -= dest_size;
         } else if (remaining_tiles > dest_size) {
             // Two dests
-            uint32_t even_remainder = remaining_tiles / 2 + ((remaining_tiles / 2) % 2);
+            std::uint32_t even_remainder = remaining_tiles / 2 + ((remaining_tiles / 2) % 2);
             num_units = even_remainder / unit_dim;
             UNPACK((llk_unpack_fast_tilize_block(icb, read_tile_index, unit_dim, num_units, full_dim)));
             MATH((llk_math_fast_tilize_block_(0, icb, unit_dim, num_units)));
@@ -545,6 +586,8 @@ ALWI void fast_tilize_block(
 #endif
 }
 
+#endif  // !ARCH_QUASAR
+
 // clang-format off
 /**
  * Uninitializes the unpack tilizeA_B configuration and restores unpacker state
@@ -569,8 +612,5 @@ ALWI void fast_tilize_block(
  * | Tile_x_dim (cntx0)        | THCON_SEC0 | Tile X dimension per context for unpacker             | Restored to FACE_DIM_16x16 (16 | (16 << 16))                                               |
  */
 // clang-format on
-ALWI void unpack_tilizeA_B_uninit(uint32_t icb) { UNPACK((llk_unpack_tilizeA_B_uninit(icb))); }
-
-#endif  // !ARCH_QUASAR
-
+ALWI void unpack_tilizeA_B_uninit(std::uint32_t icb) { UNPACK((llk_unpack_tilizeA_B_uninit(icb))); }
 }  // namespace ckernel

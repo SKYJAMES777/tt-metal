@@ -277,6 +277,62 @@ std::vector<uint32_t> gold_standard_tilize_w_elwadd(
     return tt::test_utils::pack_vector<uint32_t, bfloat16>(result_vec);
 }
 
+std::vector<uint32_t> gold_standard_tilize_w_reduce_col_max(
+    const std::vector<uint32_t>& src0_vec, const std::vector<uint32_t>& src1_vec, const GoldenConfig& config) {
+    // Extract scaler from src1_vec (first bfloat16 element)
+    float scaler = 1.0f;
+    if (!src1_vec.empty()) {
+        std::vector<bfloat16> scaler_unpacked = tt::test_utils::unpack_vector<bfloat16, uint32_t>(src1_vec);
+        scaler = static_cast<float>(scaler_unpacked[0]);
+    }
+
+    // Tilize the row-major input
+    std::vector<uint32_t> tilized = gold_standard_tilize(src0_vec, config);
+    std::vector<bfloat16> tilized_unpacked = tt::test_utils::unpack_vector<bfloat16, uint32_t>(tilized);
+
+    int num_tiles_r = config.num_tiles_r_dim;
+    int num_tiles_c = config.num_tiles_c_dim;
+    constexpr int face_dim = 16;
+    constexpr int face_elems = face_dim * face_dim;
+    constexpr int tile_elems = 4 * face_elems;
+
+    // Reduce column with PoolType::MAX
+    // Output: 1 tile-row x num_tiles_c tiles, only row 0 populated (reduce mask zeros the rest)
+    std::vector<bfloat16> result(num_tiles_c * tile_elems, bfloat16(0.0f));
+
+    for (int tc = 0; tc < num_tiles_c; tc++) {  // iterate over tile columns
+        std::vector<float> col_max(32, -std::numeric_limits<float>::max());
+
+        for (int tr = 0; tr < num_tiles_r; tr++) {  // iterate over tile rows
+            int tile_offset = (tr * num_tiles_c + tc) * tile_elems;
+
+            for (int row = 0; row < 32; row++) {
+                int face_row = row / face_dim;
+                int row_within_face = row % face_dim;
+                for (int col = 0; col < 32; col++) {
+                    int face_col = col / face_dim;
+                    int col_within_face = col % face_dim;
+                    int face_index = face_row * 2 + face_col;
+                    int elem = tile_offset + face_index * face_elems + row_within_face * face_dim + col_within_face;
+                    col_max[col] = fmaxf(col_max[col], static_cast<float>(tilized_unpacked[elem]));
+                }
+            }
+        }
+
+        int out_offset = tc * tile_elems;
+        // Row 0, cols 0-15 -> Face 0, row 0
+        for (int c = 0; c < face_dim; c++) {
+            result[out_offset + c] = bfloat16(col_max[c] * scaler);
+        }
+        // Row 0, cols 16-31 -> Face 1, row 0
+        for (int c = face_dim; c < 32; c++) {
+            result[out_offset + face_elems + (c - face_dim)] = bfloat16(col_max[c] * scaler);
+        }
+    }
+
+    return tt::test_utils::pack_vector<uint32_t, bfloat16>(result);
+}
+
 std::vector<uint32_t> gold_standard_pack_rows(const std::vector<uint32_t>& src_vec, const PackRowsConfig& config) {
     // Each row = 16 datums = 8 uint32_t (bfloat16 pairs)
     size_t num_uint32_to_extract = config.num_rows * 8;
