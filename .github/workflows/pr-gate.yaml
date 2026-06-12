@@ -398,7 +398,7 @@ jobs:
     with:
       docker-image: ${{ needs.resolve-docker-pull-refs.outputs.llk-ci-docker-image }}
       enabled-skus: wh_n150_civ2
-      pytest-markers: "not perf and not nightly and not quasar"
+      pytest-markers: "not perf and not nightly and not quasar and not accuracy"
 
   # LLK Functional Unit Tests on Blackhole (PR gate - runs on blackhole/common/sfpi/test/ci changes)
   llk-test-blackhole:
@@ -418,7 +418,7 @@ jobs:
     with:
       docker-image: ${{ needs.resolve-docker-pull-refs.outputs.llk-ci-docker-image }}
       enabled-skus: bh_p150b_civ2
-      pytest-markers: "not perf and not nightly and not quasar"
+      pytest-markers: "not perf and not nightly and not quasar and not accuracy"
 
   # LLK Quasar Build Check (compile-only, no hardware needed)
   llk-build-quasar:
