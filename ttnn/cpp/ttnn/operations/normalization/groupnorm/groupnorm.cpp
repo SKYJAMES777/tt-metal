@@ -183,6 +183,19 @@ Tensor group_norm(
         input_tensor.memory_config().memory_layout() != TensorMemoryLayout::WIDTH_SHARDED,
         "Unsupported memory layout: Input tensor cannot be width-sharded.");
 
+    // Interleaved (non-sharded) ROW_MAJOR input is supported by tilizing on-core inside the
+    // reader/compute kernels (TILIZE_IN path), mirroring how the sharded kernel handles a
+    // ROW_MAJOR shard. No host-side tilize is performed here. The Welford interleaved kernels do
+    // not yet implement the on-core tilize path, so reject that combination with a clear error
+    // instead of hanging.
+    const bool rm_interleaved_input = !input_tensor.is_sharded() && input_tensor.layout() == Layout::ROW_MAJOR;
+    if (rm_interleaved_input) {
+        TT_FATAL(
+            !use_welford,
+            "group_norm: ROW_MAJOR interleaved (non-sharded) input is not supported with use_welford=true yet. "
+            "Use use_welford=false, provide a TILE-layout input, or use a sharded input.");
+    }
+
     const auto& input_shape = input_tensor.logical_shape();
     TT_FATAL(
         input_shape.rank() == 4, "Invalid tensor shape: Input tensor must have rank 4. (rank={})", input_shape.rank());

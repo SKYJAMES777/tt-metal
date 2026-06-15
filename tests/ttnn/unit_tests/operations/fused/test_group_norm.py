@@ -1260,7 +1260,7 @@ def test_group_norm_negative_tests(
     device,
 ):
     input_tensor = ttnn.empty(input_shape, device=device)
-    with pytest.raises(RuntimeError, match=msg_pattern):
+    with expect_error(RuntimeError, match=msg_pattern):
         ttnn.group_norm(
             input_tensor,
             num_groups=num_groups,
@@ -1273,7 +1273,7 @@ def test_group_norm_rejects_host_input_mask(device):
     input_tensor = ttnn.empty((1, 1, 32, 320), device=device)
     input_mask = ttnn.create_group_norm_input_mask(320, 32, 1, ttnn.DataType.BFLOAT16)
 
-    with pytest.raises(RuntimeError, match="Input mask must be on device"):
+    with expect_error(RuntimeError, match="Input mask must be on device"):
         ttnn.group_norm(
             input_tensor,
             num_groups=32,
@@ -1306,7 +1306,7 @@ def test_group_norm_rejects_host_negative_mask(device):
     )
     input_tensor = ttnn.to_memory_config(input_tensor, memory_config=sharded_mem_config)
 
-    with pytest.raises(RuntimeError, match="Negative mask must be on device"):
+    with expect_error(RuntimeError, match="Negative mask must be on device"):
         ttnn.group_norm(
             input_tensor,
             num_groups=32,
@@ -1494,4 +1494,160 @@ def test_group_norm_optional_weight_bias(
         rtol=rtol,
         atol=atol,
         frobenius_threshold=frobenius_threshold,
+    )
+
+
+@pytest.mark.parametrize("output_layout", [None, ttnn.ROW_MAJOR_LAYOUT, ttnn.TILE_LAYOUT])
+@pytest.mark.parametrize("with_affine", [False, True], ids=["no_weight_bias", "weight_bias"])
+def test_group_norm_row_major_interleaved_input(device, output_layout, with_affine):
+    """A ROW_MAJOR interleaved (non-sharded) input must run correctly (issue #26594).
+
+    The interleaved group_norm reader used to read tiled DRAM pages directly with no row-major
+    un-tiling step (only the sharded kernel internally tilizes a ROW_MAJOR shard). Passing a
+    ROW_MAJOR interleaved tensor therefore made the device read mis-formatted data and hang
+    indefinitely - even with weight, bias and input_mask all omitted (the exact combination
+    that hung). The interleaved kernels now tilize ROW_MAJOR input on-core (the reader gathers
+    row-major rows into a CB and the compute kernel tilizes them per block, mirroring the
+    sharded path) and, when a ROW_MAJOR output is requested, untilize the result on-core (the
+    compute kernel untilizes into a row-major CB and the writer scatters the rows back to the
+    ROW_MAJOR DRAM output). The output layout defaults to the input's ROW_MAJOR layout, so the
+    call completes and produces correct results instead of wedging the board.
+    """
+    torch.manual_seed(0)
+
+    N, C, H, W, num_groups = 1, 480, 1, 64, 8
+    epsilon = 1e-5
+
+    torch_input = torch.rand((N, C, H, W), dtype=torch.bfloat16)
+    torch_weight = torch.rand((C,), dtype=torch.bfloat16) if with_affine else None
+    torch_bias = torch.rand((C,), dtype=torch.bfloat16) if with_affine else None
+
+    torch_output = torch.nn.functional.group_norm(
+        torch_input.float(),
+        num_groups,
+        weight=torch_weight.float() if torch_weight is not None else None,
+        bias=torch_bias.float() if torch_bias is not None else None,
+        eps=epsilon,
+    )
+    torch_output = torch_output.permute(0, 2, 3, 1).view(N, 1, H * W, C)
+
+    # ROW_MAJOR, interleaved DRAM input (deliberately not tilized) - the layout that triggered the hang.
+    tt_input = torch_input.permute(0, 2, 3, 1).view(N, 1, H * W, C)
+    input_tensor = ttnn.from_torch(
+        tt_input,
+        dtype=ttnn.DataType.BFLOAT16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+
+    grid_size = ttnn.CoreGrid(y=1, x=1)
+
+    gamma_t, beta_t = None, None
+    if with_affine:
+        gamma_t, beta_t = ttnn.dram_group_norm_params_from_torch(
+            [torch_weight.float(), torch_bias.float()],
+            C,
+            num_groups,
+            device,
+            core_grid=grid_size,
+            return_mask=False,
+        )
+
+    output_tensor = ttnn.group_norm(
+        input_tensor,
+        num_groups=num_groups,
+        epsilon=epsilon,
+        weight=gamma_t,
+        bias=beta_t,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        core_grid=grid_size,
+        inplace=False,
+        output_layout=output_layout,
+    )
+
+    # When output_layout is unspecified the result should match the input's ROW_MAJOR layout.
+    expected_layout = output_layout if output_layout is not None else ttnn.ROW_MAJOR_LAYOUT
+    assert output_tensor.layout == expected_layout
+
+    output_tensor = ttnn.to_torch(ttnn.from_device(output_tensor))
+
+    assert_numeric_metrics(
+        torch_output,
+        output_tensor,
+        pcc_threshold=0.9999,
+        rtol=0.065,
+        atol=0.065,
+        frobenius_threshold=0.016,
+    )
+
+
+@pytest.mark.parametrize("output_layout", [ttnn.ROW_MAJOR_LAYOUT, ttnn.TILE_LAYOUT])
+def test_group_norm_row_major_interleaved_uneven_num_out_blocks(device, output_layout):
+    """ROW_MAJOR interleaved with num_out_blocks that does not divide block_h (ragged final out-block).
+
+    H*W=160 -> block_h=5 tiles; num_out_blocks=2 -> out_block_h_normal=2, ragged final out-block of
+    out_block_h_last=1. The on-core tilize/untilize processes the full normal out-block; only the
+    out_block_h_actual rows are used by the math and written out."""
+    torch.manual_seed(0)
+
+    N, C, H, W, num_groups = 1, 480, 1, 160, 8
+    num_out_blocks = 2
+    epsilon = 1e-5
+
+    torch_input = torch.rand((N, C, H, W), dtype=torch.bfloat16)
+    torch_weight = torch.rand((C,), dtype=torch.bfloat16)
+    torch_bias = torch.rand((C,), dtype=torch.bfloat16)
+
+    torch_output = torch.nn.functional.group_norm(
+        torch_input.float(),
+        num_groups,
+        weight=torch_weight.float(),
+        bias=torch_bias.float(),
+        eps=epsilon,
+    )
+    torch_output = torch_output.permute(0, 2, 3, 1).view(N, 1, H * W, C)
+
+    tt_input = torch_input.permute(0, 2, 3, 1).view(N, 1, H * W, C)
+    input_tensor = ttnn.from_torch(
+        tt_input,
+        dtype=ttnn.DataType.BFLOAT16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+
+    grid_size = ttnn.CoreGrid(y=1, x=1)
+    gamma_t, beta_t = ttnn.dram_group_norm_params_from_torch(
+        [torch_weight.float(), torch_bias.float()],
+        C,
+        num_groups,
+        device,
+        core_grid=grid_size,
+        return_mask=False,
+    )
+
+    output_tensor = ttnn.group_norm(
+        input_tensor,
+        num_groups=num_groups,
+        epsilon=epsilon,
+        weight=gamma_t,
+        bias=beta_t,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        core_grid=grid_size,
+        inplace=False,
+        num_out_blocks=num_out_blocks,
+        output_layout=output_layout,
+    )
+
+    assert output_tensor.layout == output_layout
+    output_tensor = ttnn.to_torch(ttnn.from_device(output_tensor))
+
+    assert_numeric_metrics(
+        torch_output,
+        output_tensor,
+        pcc_threshold=0.9999,
+        rtol=0.065,
+        atol=0.065,
+        frobenius_threshold=0.016,
     )
