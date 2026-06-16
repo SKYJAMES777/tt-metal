@@ -23,8 +23,5 @@ set(TTNN_OP_TRANSFORMER_SRCS
     sdpa_decode/device/sdpa_decode_device_operation.cpp
     sdpa_decode/device/sdpa_decode_program_factory.cpp
     sdpa_decode/sdpa_decode.cpp
-    sdpa_windowed/device/sdpa_windowed_device_operation.cpp
-    sdpa_windowed/device/sdpa_windowed_program_factory.cpp
-    sdpa_windowed/sdpa_windowed.cpp
     split_query_key_value_and_split_heads/split_query_key_value_and_split_heads.cpp
 )
