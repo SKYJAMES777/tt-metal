@@ -19,10 +19,11 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_miss(
     const auto& x = tensor_args.input_tensor;
     const auto& rw = tensor_args.routing_weights;
 
-    (void)attributes;
     TT_FATAL(x.storage_type() == StorageType::DEVICE, "fused_experts: input_tensor must be on device");
     TT_FATAL(rw.storage_type() == StorageType::DEVICE, "fused_experts: routing_weights must be on device");
-    // input_tensor is broadcast verbatim page-by-page, so any layout (ROW_MAJOR / TILE) is fine.
+    // The matmul consumes the activation as tiles, so the input must be TILE layout ([1,1,1,H] -> Kt tiles).
+    TT_FATAL(
+        x.layout() == tt::tt_metal::Layout::TILE, "fused_experts: input_tensor must be TILE layout for the matmul");
 
     // First version reads routing_weights element-by-element on a single core, so it must be a
     // contiguous ROW_MAJOR bfloat16 row.
@@ -39,20 +40,31 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_miss(
         tensor_args.down_weights.size());
 
     // Expert selection/scaling is on-device: weight i is scaled by routing_weights column i, so the
-    // routing-weight width must match the number of weight pairs.
-    const uint32_t num_experts = static_cast<uint32_t>(tensor_args.gate_up_weights.size());
-    TT_FATAL(num_experts > 0, "fused_experts: need at least one expert");
+    // routing-weight width must match the number of provided weight pairs.
+    const uint32_t num_weights = static_cast<uint32_t>(tensor_args.gate_up_weights.size());
+    TT_FATAL(num_weights > 0, "fused_experts: need at least one expert");
     TT_FATAL(
-        static_cast<uint32_t>(rw.logical_shape()[-1]) == num_experts,
+        static_cast<uint32_t>(rw.logical_shape()[-1]) == num_weights,
         "fused_experts: routing_weights last dim ({}) must equal the number of experts ({})",
         rw.logical_shape()[-1],
-        num_experts);
+        num_weights);
+
+    // The op takes all `num_weights` experts and runs the gate_up matmul only for the
+    // `num_experts` routing-selected ("hit") experts; the caller must pass the actual
+    // hit count (the number of nonzero routing-weight columns).
+    TT_FATAL(
+        attributes.num_experts > 0 && attributes.num_experts <= num_weights,
+        "fused_experts: num_experts ({}) must be in [1, {}]",
+        attributes.num_experts,
+        num_weights);
 
     // gate_up weights must be DRAM ND-sharded so that each shard is exactly one core's
-    // [K, 64] column slice (read in a single NoC read by the dataflow kernels). The 8x8
-    // compute grid owns 64 column slices of 2 tiles (64 cols) each.
-    constexpr uint32_t kColsPerCore = 64;
-    for (uint32_t e = 0; e < num_experts; ++e) {
+    // [K, 128] column slice (read in a single NoC read by the dataflow kernels). The
+    // weight is permuted on the host into per-core [gate_64 | up_64] blocks, so each
+    // shard holds a core's 2 gate tiles plus their paired up tiles (128 cols). I/64
+    // shards cover the SwiGLU output I dim.
+    constexpr uint32_t kColsPerCore = 128;
+    for (uint32_t e = 0; e < num_weights; ++e) {
         const auto& w = tensor_args.gate_up_weights[e];
         TT_FATAL(
             w.buffer()->buffer_type() == tt::tt_metal::BufferType::DRAM,
@@ -63,7 +75,7 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_miss(
         const auto& shard_shape = nd->shard_shape;
         TT_FATAL(
             static_cast<uint32_t>(shard_shape[-1]) == kColsPerCore,
-            "fused_experts: gate_up_weights[{}] shard last dim ({}) must be {} (one core's 2-tile column slice)",
+            "fused_experts: gate_up_weights[{}] shard last dim ({}) must be {} (one core's [gate_64 | up_64] slice)",
             e,
             shard_shape[-1],
             kColsPerCore);
@@ -81,6 +93,22 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_miss(
         "fused_experts: decode op expects sequence length 1, got {}",
         x.logical_shape()[-2]);
 
+    // Matmul contraction dim: input H must match gate_up K (rows).
+    TT_FATAL(
+        static_cast<uint32_t>(x.logical_shape()[-1]) ==
+            static_cast<uint32_t>(tensor_args.gate_up_weights.front().logical_shape()[-2]),
+        "fused_experts: input hidden dim ({}) must equal gate_up K ({})",
+        x.logical_shape()[-1],
+        tensor_args.gate_up_weights.front().logical_shape()[-2]);
+
+    // SwiGLU splits the gate_up output (2I) into gate/up halves of size I each.
+    const uint32_t two_intermediate = static_cast<uint32_t>(tensor_args.gate_up_weights.front().logical_shape()[-1]);
+    TT_FATAL(
+        two_intermediate == 2u * attributes.intermediate_size,
+        "fused_experts: gate_up output dim ({}) must equal 2 * intermediate_size ({})",
+        two_intermediate,
+        2u * attributes.intermediate_size);
+
     // TODO: validate per-expert weight shapes against H / 2I / I, dtypes, and tile alignment.
 }
 
@@ -91,15 +119,21 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_hit(
 
 FusedExpertsDeviceOperation::spec_return_value_t FusedExpertsDeviceOperation::compute_output_specs(
     const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
-    // First version: the output holds the selected expert ids, [1, 1, 1, E] UINT32 ROW_MAJOR.
-    // Slots [0, num_hits) hold the sorted hit expert ids; the rest are padded with `E` ("no expert").
-    const uint32_t num_experts = static_cast<uint32_t>(tensor_args.gate_up_weights.size());
-    const ttnn::Shape output_shape({1, 1, 1, num_experts});
+    (void)tensor_args;
+    // The output holds the gate_up matmul + SwiGLU activation for the routing-selected
+    // experts in ascending hit-id order:
+    //   output[i] = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit),
+    //   where [gate, up] = x @ gate_up_w[hit_ids[i]].
+    // Shape [num_experts, 1, I] (decode token row, padded to a 32-row tile in TILE
+    // layout), BFLOAT16.
+    const uint32_t num_experts = attributes.num_experts;
+    const uint32_t intermediate = attributes.intermediate_size;
+    const ttnn::Shape output_shape({num_experts, 1, intermediate});
     return TensorSpec(
         output_shape,
         tt::tt_metal::TensorLayout(
-            tt::tt_metal::DataType::UINT32,
-            tt::tt_metal::PageConfig(tt::tt_metal::Layout::ROW_MAJOR),
+            tt::tt_metal::DataType::BFLOAT16,
+            tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE),
             attributes.output_memory_config));
 }
 
@@ -115,10 +149,12 @@ FusedExpertsDeviceOperation::invoke(
     const Tensor& routing_weights,
     const std::vector<Tensor>& gate_up_weights,
     const std::vector<Tensor>& down_weights,
+    uint32_t num_experts,
     uint32_t intermediate_size,
     float swiglu_limit,
     const std::optional<MemoryConfig>& memory_config) {
     operation_attributes_t attributes{
+        .num_experts = num_experts,
         .intermediate_size = intermediate_size,
         .swiglu_limit = swiglu_limit,
         .output_memory_config = memory_config.value_or(input_tensor.memory_config()),
@@ -141,12 +177,20 @@ fused_experts(
     const Tensor& routing_weights,
     const std::vector<Tensor>& gate_up_weights,
     const std::vector<Tensor>& down_weights,
+    uint32_t num_experts,
     uint32_t intermediate_size,
     float swiglu_limit,
     const std::optional<MemoryConfig>& memory_config) {
     using OperationType = ttnn::operations::experimental::deepseek::moe::fused_experts::FusedExpertsDeviceOperation;
     auto [operation_attributes, tensor_args] = OperationType::invoke(
-        input_tensor, routing_weights, gate_up_weights, down_weights, intermediate_size, swiglu_limit, memory_config);
+        input_tensor,
+        routing_weights,
+        gate_up_weights,
+        down_weights,
+        num_experts,
+        intermediate_size,
+        swiglu_limit,
+        memory_config);
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
 }  // namespace ttnn::prim

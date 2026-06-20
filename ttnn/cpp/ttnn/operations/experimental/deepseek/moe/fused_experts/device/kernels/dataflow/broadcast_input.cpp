@@ -16,32 +16,32 @@
 // Uses the *other* NoC (NoC 1) so it runs concurrently with the expert-id sender
 // on {0,0} (NoC 0).
 //
-// The activations are broadcast verbatim, page-by-page, so the kernel is layout
-// agnostic (works for ROW_MAJOR and TILE inputs alike): it copies every page of
-// input_tensor into a contiguous L1 buffer and multicasts the whole buffer.
+// The activation is read tile-by-tile into cb_input (Kt == H/32 tiles, the decode
+// token row padded to a 32-row tile), multicast verbatim to every other core's L1
+// (same cb_input address), and then published to this core's compute kernel.
 //
-//   1. Reads all input_num_pages pages of input_tensor into cb_input.
-//   2. Multicasts the buffer to every other core's L1 (same cb_input address).
+//   1. Reads all Kt tiles of input_tensor into cb_input.
+//   2. Multicasts the tiles to every other core's L1 (same cb_input address).
 //   3. Sets + multicasts the input-ready semaphore to signal the other cores.
+//   4. Publishes cb_input to this core's compute kernel.
+//   5. Waits for the expert-id broadcast, then fetches this core's gate_up weight
+//      slice for the routing-selected experts.
 //
 // NoC 1 multicasts traverse from high to low coordinates, so the host passes the
 // multicast rectangle with start = bottom-right corner, end = top-left corner.
 //
-// After broadcasting it waits for the expert ids ({0,0}'s broadcast) and then
-// fetches this core's gate_up weight slice for each active expert.
-//
 // Compile-time args:
-//   0: cb_input         (L1 buffer holding the activations; broadcast to all cores)
-//   1: input_page_size  (bytes per page of input_tensor)
-//   2: input_num_pages  (number of pages of input_tensor)
+//   0: cb_input         (activation tiles; broadcast to all cores)
+//   1: input_page_size  (bytes per tile of input_tensor)
+//   2: input_num_pages  (Kt == H / 32)
 //   3: sem_input_id     (input-ready semaphore)
-//   4: sem_id           (expert-ids-ready semaphore)
-//   5: num_experts (E)
-//   6: cb_bcast         (L1 buffer holding the expert ids)
-//   7: cb_weights       (L1 buffer for this core's gate_up slice)
-//   8: k_tiles          (H / 32)
-//   9: n_tiles          (2I / 32)
-//   10: tile_bytes
+//   4: sem_id           (expert-ids-ready / sequencing semaphore)
+//   5: num_active       (routing-selected experts to run)
+//   6: cb_weights       (this core's per-expert weight slice)
+//   7: k_tiles          (H / 32)
+//   8: i_tiles          (I / 32, SwiGLU output tile cols)
+//   9: tile_bytes
+//   10: cb_bcast        (broadcast hit-expert ids, read by the weight fetch)
 //   11+: TensorAccessorArgs(input_tensor), TensorAccessorArgs(gate_up)
 //
 // Runtime args:
@@ -57,12 +57,12 @@ void kernel_main() {
     constexpr uint32_t input_num_pages = get_compile_time_arg_val(2);
     constexpr uint32_t sem_input_id = get_compile_time_arg_val(3);
     constexpr uint32_t sem_id = get_compile_time_arg_val(4);
-    constexpr uint32_t num_experts = get_compile_time_arg_val(5);
-    constexpr uint32_t cb_bcast_id = get_compile_time_arg_val(6);
-    constexpr uint32_t cb_weights_id = get_compile_time_arg_val(7);
-    constexpr uint32_t k_tiles = get_compile_time_arg_val(8);
-    constexpr uint32_t n_tiles = get_compile_time_arg_val(9);
-    constexpr uint32_t tile_bytes = get_compile_time_arg_val(10);
+    constexpr uint32_t num_active = get_compile_time_arg_val(5);
+    constexpr uint32_t cb_weights_id = get_compile_time_arg_val(6);
+    constexpr uint32_t k_tiles = get_compile_time_arg_val(7);
+    constexpr uint32_t i_tiles = get_compile_time_arg_val(8);
+    constexpr uint32_t tile_bytes = get_compile_time_arg_val(9);
+    constexpr uint32_t cb_bcast_id = get_compile_time_arg_val(10);
 
     constexpr auto input_args = TensorAccessorArgs<11>();
     constexpr auto gate_up_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
@@ -82,15 +82,15 @@ void kernel_main() {
 
     CircularBuffer cb_input(cb_input_id);
 
-    // ---- 1. Read all activation pages into cb_input. ----
-    cb_input.reserve_back(1);
+    // ---- 1. Read all activation tiles into cb_input. ----
+    cb_input.reserve_back(input_num_pages);
     const uint32_t input_l1 = cb_input.get_write_ptr();
     for (uint32_t p = 0; p < input_num_pages; ++p) {
         noc.async_read(input, cb_input, input_page_size, {.page_id = p}, {.offset_bytes = p * input_page_size});
     }
     noc.async_read_barrier();
 
-    // ---- 2. Broadcast the activations to all other cores' L1 (same cb_input address). ----
+    // ---- 2. Broadcast the activation to all other cores' L1 (same cb_input address). ----
     const uint32_t total_bytes = input_page_size * input_num_pages;
     noc.async_write_multicast(
         CoreLocalMem<uint32_t>(input_l1),
@@ -111,15 +111,18 @@ void kernel_main() {
     sem.set(1);
     sem.set_multicast(noc, mcast_start_x, mcast_start_y, mcast_end_x, mcast_end_y, num_dests, /*linked=*/false);
 
-    // ---- 4. Wait for the expert ids ({0,0}'s broadcast), then fetch our weight slice. ----
+    // ---- 4. Publish the activation to this core's compute kernel. ----
+    cb_input.push_back(input_num_pages);
+
+    // ---- 5. Wait for the expert-id broadcast, then fetch our selected weight slices. ----
     Semaphore<>(sem_id).wait(1);
     fetch_gate_up_slices(
         noc,
         cb_bcast_id,
         cb_weights_id,
-        num_experts,
+        num_active,
         k_tiles,
-        n_tiles,
+        i_tiles,
         tile_bytes,
         col_start_tile,
         gate_up_args,

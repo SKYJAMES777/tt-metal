@@ -13,75 +13,88 @@
 
 // Per-core gate_up weight fetch (shared by all kernels in this op).
 //
-// Each core owns a 2-tile-wide (64 column) slice of the first matmul's N == 2I
-// dimension: the tiles [col_start_tile, col_start_tile + 1]. For a gate_up weight
-// of shape [K, N] (K == H rows, N == 2I cols) laid out in TILE layout, this core
-// needs the [K, 64] column slice, i.e. k_tiles * 2 tiles.
+// Each active core owns a 2-tile (64 column) slice of the SwiGLU output I dimension:
+// output tiles [col_start_tile, col_start_tile + 1]. Computing that SwiGLU slice needs
+// both the gate columns [64c, 64c+64) and the paired up columns [I+64c, I+64c+64) of
+// the [K, 2I] gate_up weight (c == this core's index).
 //
-// The gate_up weights are stored DRAM ND-sharded so that each shard is exactly one
-// core's [K, 64] column slice (shard shape [K, 64] in elements -> [k_tiles, 2] in
-// tiles). The shards are round-robin distributed across the DRAM banks, and the
-// pages of a shard are contiguous within its bank, so this core's entire weight
-// slice for one expert can be pulled in a *single* NoC read of the whole shard.
-// Shard id == this core's compute index == col_start_tile / 2.
+// To keep all of that in one DRAM shard, the gate_up weight is reshaped+permuted on
+// the host into per-core [gate_64 | up_64] blocks, so each shard is this core's
+// [K, 128] slice (shard shape [K, 128] in elements -> [k_tiles, 4] in tiles: tile cols
+// 0,1 == gate, tile cols 2,3 == up). The shards are round-robin distributed across the
+// DRAM banks with contiguous pages, so this core's entire gate+up weight for one
+// expert is pulled in a *single* NoC read. Shard id == this core's index ==
+// col_start_tile / 2.
 //
-// The expert ids (compacted at the front of cb_bcast, sentinel-padded) tell the
-// core which experts are active; the slice is fetched once per active expert.
+// The op takes *all* experts' weights as input and uses the routing weights to
+// select which experts to run. The selected ("hit") expert ids are computed on
+// device and broadcast into cb_bcast as a compacted, ascending list; this core
+// fetches only those `num_active` experts. The i-th fetched shard belongs to
+// expert ids[i], and feeds the i-th output row (matmul + writer loop in lock-step).
 //
 // Arguments:
 //   noc               NoC instance to use for the reads.
-//   cb_bcast_id       CB holding the UINT32 expert ids.
-//   cb_weights_id     CB receiving this core's weight slice.
-//   num_experts       E (also the sentinel value for "no expert").
+//   cb_bcast_id       CB holding the broadcast hit-expert ids (ascending).
+//   cb_weights_id     CB receiving this core's weight slice (producer side).
+//   num_active        Number of routing-selected experts to run.
 //   k_tiles           K / 32 (number of tile rows of the weight).
-//   n_tiles           N / 32 (number of tile cols of the weight).
+//   i_tiles           I / 32 (SwiGLU output tile cols; cores past it are idle).
 //   tile_bytes        Size of one tile in bytes.
-//   col_start_tile    This core's first output N-tile (= compute_index * 2).
+//   col_start_tile    This core's first SwiGLU output tile (= compute_index * 2).
 //   gate_up_args      Shared TensorAccessorArgs (all experts share one layout).
 //   rt_w_addr_base    Runtime-arg index of the first gate_up base address.
+// The activation row is delivered into every core's cb_input L1 region by the
+// input broadcaster's multicast (receivers) or by a direct DRAM read (the
+// broadcaster itself). Advancing cb_input by k_tiles pages publishes it to the
+// matmul compute kernel. Receivers call this once the input-ready semaphore fires.
+inline void publish_input(uint32_t cb_input_id, uint32_t k_tiles) {
+    CircularBuffer cb_input(cb_input_id);
+    cb_input.reserve_back(k_tiles);
+    cb_input.push_back(k_tiles);
+}
+
 template <typename GateUpArgs>
 void fetch_gate_up_slices(
     const Noc& noc,
     uint32_t cb_bcast_id,
     uint32_t cb_weights_id,
-    uint32_t num_experts,
+    uint32_t num_active,
     uint32_t k_tiles,
-    uint32_t n_tiles,
+    uint32_t i_tiles,
     uint32_t tile_bytes,
     uint32_t col_start_tile,
     const GateUpArgs& gate_up_args,
     uint32_t rt_w_addr_base) {
-    // Cores whose column slice falls outside the weight do nothing.
-    if (col_start_tile >= n_tiles) {
+    // Cores whose SwiGLU output slice falls outside I do nothing.
+    if (col_start_tile >= i_tiles) {
         return;
     }
 
-    constexpr uint32_t kTilesPerCore = 2;
-    const uint32_t slice_tiles = k_tiles * kTilesPerCore;
-    // One DRAM shard == this core's whole [K, 64] slice; read it in one shot.
+    // The shard is this core's 2 output tiles' gate (tiles 0,1) + up (tiles 2,3) = 4 tile cols.
+    constexpr uint32_t kOutTilesPerCore = 2;
+    constexpr uint32_t kShardTileCols = 2 * kOutTilesPerCore;  // gate 2 | up 2
+    const uint32_t slice_tiles = k_tiles * kShardTileCols;
+    // One DRAM shard == this core's whole [K, 128] gate+up slice; read it in one shot.
     const uint32_t slice_bytes = slice_tiles * tile_bytes;
-    const uint32_t shard_id = col_start_tile / kTilesPerCore;
+    const uint32_t shard_id = col_start_tile / kOutTilesPerCore;
 
+    // The hit-expert ids were broadcast into cb_bcast (ascending, compacted at the
+    // front). cb_bcast is never advanced, so the ids live at its write pointer.
     CircularBuffer cb_bcast(cb_bcast_id);
-    CircularBuffer cb_weights(cb_weights_id);
     CoreLocalMem<volatile uint32_t> ids(cb_bcast.get_write_ptr());
 
-    // Reserve once and reuse: there is no consumer yet, so each expert overwrites
-    // the slice. A later compute milestone will push/pop per expert instead.
-    cb_weights.reserve_back(slice_tiles);
+    CircularBuffer cb_weights(cb_weights_id);
 
-    for (uint32_t i = 0; i < num_experts; ++i) {
-        const uint32_t e = ids[i];
-        if (e >= num_experts) {
-            break;  // sentinel: active ids are compacted at the front.
-        }
-
-        const uint32_t w_addr = get_arg_val<uint32_t>(rt_w_addr_base + e);
+    for (uint32_t i = 0; i < num_active; ++i) {
+        const uint32_t expert = ids[i];
+        const uint32_t w_addr = get_arg_val<uint32_t>(rt_w_addr_base + expert);
         const auto w = TensorAccessor(gate_up_args, w_addr);
 
         // Single NoC read of this expert's entire shard for this core.
+        cb_weights.reserve_back(slice_tiles);
         ShardView w_shard(w);
         noc.async_read(w_shard, cb_weights, slice_bytes, {.shard_id = shard_id}, {.offset_bytes = 0});
         noc.async_read_barrier();
+        cb_weights.push_back(slice_tiles);
     }
 }

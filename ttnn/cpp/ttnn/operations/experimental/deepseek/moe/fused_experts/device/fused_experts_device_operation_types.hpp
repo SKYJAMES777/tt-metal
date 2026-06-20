@@ -14,6 +14,11 @@ namespace ttnn::operations::experimental::deepseek::moe::fused_experts {
 
 // Non-tensor parameters of the fused routed-expert FFN.
 struct operation_attributes_t {
+    // Number of experts to actually run through the gate_up matmul (the first `num_experts`
+    // of the provided weight list). Must be in [1, gate_up_weights.size()]. The output's
+    // leading dimension is this value.
+    uint32_t num_experts{};
+
     // SwiGLU intermediate size (I). gate_up weights are [H, 2I], down weights are [I, H].
     uint32_t intermediate_size{};
 

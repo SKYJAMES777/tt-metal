@@ -2,17 +2,22 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit test for ttnn.experimental.deepseek.moe.fused_experts (first version).
+"""Unit test for ttnn.experimental.deepseek.moe.fused_experts (gate_up + SwiGLU milestone).
 
-The first version of the op performs the expert *selection* that the model currently
-does on host:
+The op takes *all* experts' weights and uses the routing weights to select which
+experts to run. For the routing-selected ("hit") experts, in ascending hit-id order,
+it computes the gate_up matmul *and* the SwiGLU gate on device:
 
-    rw_host = ttnn.to_torch(routing_weights).reshape(T, E)
-    hit = (rw_host.abs().sum(dim=0) > 0).nonzero().flatten().tolist()
+    gu        = x @ gate_up_w[hit_ids[i]]                 # [1, H] @ [H, 2I] -> [1, 2I]
+    output[i] = silu(clamp(gu[:I], max=L)) * clamp(gu[I:], -L, L)   # -> [1, I]
 
-A single core reads the routing weights, computes the hit expert ids on-device, and
-writes them to a [1, 1, 1, E] UINT32 output tensor: the sorted hit ids compacted at the
-front, with the remaining slots padded with the sentinel value E ("no expert").
+The I output columns are distributed across the compute grid: each active core owns a
+2-tile (64-column) slice of the SwiGLU output and needs both the gate columns
+[64c, 64c+64) and the paired up columns [I+64c, I+64c+64) of the gate_up weight. To
+keep that data in a *single* DRAM shard (one NoC read), the gate_up weight is
+reshaped+permuted on the host into per-core [gate_64 | up_64] blocks, so each shard is
+a [H, 128] slice. The output tensor is [num_active, 1, I] in TILE layout (the decode
+token row padded to a 32-row tile), BFLOAT16.
 
 Decode-only: sequence length T == 1.
 """
@@ -22,20 +27,24 @@ import torch
 import ttnn
 import random
 
+from models.common.utility_functions import comp_pcc, comp_allclose
 
-# fused_experts uses an 8×8 compute grid; each core owns a width slice of 2 tiles (64 cols).
+
+# fused_experts uses an 8x8 compute grid; each active core owns a 2-tile SwiGLU output
+# slice (64 cols), reading a [H, 128] (gate 64 | up 64) gate_up shard.
 FUSED_EXPERTS_GRID = 8
 FUSED_EXPERTS_NUM_CORES = FUSED_EXPERTS_GRID * FUSED_EXPERTS_GRID
 BH_NUM_DRAM_BANKS = 8
+COLS_PER_CORE = 64  # SwiGLU output columns per core (2 tiles)
 
 
-def _nd_sharded_dram_memory_config(rows: int, cols: int, dram_core_range_set: ttnn.CoreRangeSet) -> ttnn.MemoryConfig:
-    """ND-sharded DRAM: ``rows`` × ``(cols / 64)`` per shard on the 8×8 compute grid."""
-    assert (
-        cols % FUSED_EXPERTS_NUM_CORES == 0
-    ), f"last dim {cols} must divide evenly across {FUSED_EXPERTS_NUM_CORES} cores"
+def _nd_sharded_dram_memory_config(
+    rows: int, cols: int, shard_width: int, dram_core_range_set: ttnn.CoreRangeSet
+) -> ttnn.MemoryConfig:
+    """ND-sharded DRAM: ``rows`` × ``shard_width`` per shard, round-robin over the DRAM banks."""
+    assert cols % shard_width == 0, f"last dim {cols} must divide evenly into shards of {shard_width}"
     dram_nd_shard_spec = ttnn.NdShardSpec(
-        shard_shape=[rows, cols // FUSED_EXPERTS_NUM_CORES],
+        shard_shape=[rows, shard_width],
         grid=dram_core_range_set,
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         shard_distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
@@ -43,51 +52,63 @@ def _nd_sharded_dram_memory_config(rows: int, cols: int, dram_core_range_set: tt
     return ttnn.MemoryConfig(ttnn.BufferType.DRAM, dram_nd_shard_spec)
 
 
-def _hit_ids(routing: torch.Tensor, num_experts: int) -> list[int]:
-    """Host reference matching the model's `hit` computation, padded to length E."""
-    hit = (routing.abs().sum(dim=0) > 0).nonzero().flatten().tolist()
-    return hit + [num_experts] * (num_experts - len(hit))
+def _interleave_gate_up(w: torch.Tensor, block: int = COLS_PER_CORE) -> torch.Tensor:
+    """Permute a [K, 2I] gate_up weight into per-core [gate_block | up_block] order so each
+    [K, 2*block] shard holds a core's gate columns followed by its paired up columns.
+
+    gate = w[:, :I], up = w[:, I:]; output column (c*2*block + h*block + t) == w[:, h*I + c*block + t].
+    """
+    k, two_i = w.shape
+    intermediate = two_i // 2
+    blocks = intermediate // block
+    return w.reshape(k, 2, blocks, block).permute(0, 2, 1, 3).reshape(k, two_i).contiguous()
+
+
+def _swiglu(gu: torch.Tensor, intermediate: int, limit: float) -> torch.Tensor:
+    """Reference SwiGLU on a [tokens, 2I] gate_up output -> [tokens, I]."""
+    gate = torch.clamp(gu[:, :intermediate], max=limit)
+    up = torch.clamp(gu[:, intermediate:], min=-limit, max=limit)
+    return torch.nn.functional.silu(gate) * up
 
 
 @pytest.mark.parametrize(
     "hidden, intermediate, num_experts, num_nonzero",
     [
-        # (128, 64, 8, 5),
-        # (256, 128, 16, 11),
-        # (128, 64, 8, 8),  # all experts selected
         # DeepSeek-V4-Flash config sizes (hidden_size=4096, moe_intermediate_size=2048).
         # The model has n_routed_experts=256; we use fewer here to keep DRAM/host memory
         # tractable for a unit test (each [4096, 4096] gate_up weight is ~32 MB).
         (4096, 2048, 64, 6),
     ],
 )
-def test_fused_experts_expert_ids(device, hidden, intermediate, num_experts, num_nonzero):
+def test_fused_experts_gate_up(device, hidden, intermediate, num_experts, num_nonzero):
     torch.manual_seed(0)
     limit = 7.0
     tokens = 1  # decode: sequence length T == 1
+    two_intermediate = 2 * intermediate
 
     x = (torch.rand((tokens, hidden), dtype=torch.bfloat16) - 0.5).float()
     x_flat = x.reshape(1, 1, tokens, hidden)
 
-    # Routing weights [T, E]; nonzero columns are the "selected" experts. Use values
-    # well above bf16 rounding noise so abs() stays strictly positive. `num_nonzero`
-    # evenly spaced columns stay nonzero; the rest are zeroed.
+    # Routing weights [T, E]; nonzero columns are the routing-selected ("hit") experts.
+    # The op runs the gate_up matmul only for those, in ascending hit-id order.
     routing = torch.rand((tokens, num_experts), dtype=torch.bfloat16).float() + 0.5
     nonzero_cols = random.sample(range(num_experts), num_nonzero)
     for c in range(num_experts):
         if c not in nonzero_cols:
             routing[:, c] = 0.0
     routing_4d = routing.reshape(1, 1, tokens, num_experts)
+    # Device scans experts 0..E-1, so the hit ids land in ascending order.
+    hit_ids = sorted(nonzero_cols)
 
-    expected_ids = _hit_ids(routing, num_experts)
-
-    # Weights are required by the op signature (E experts) but unused by this version.
     gate_up_weights = [
-        (torch.rand((hidden, 2 * intermediate), dtype=torch.bfloat16) - 0.5).float() for _ in range(num_experts)
+        (torch.rand((hidden, two_intermediate), dtype=torch.bfloat16) - 0.5).float() for _ in range(num_experts)
     ]
     down_weights = [
         (torch.rand((intermediate, hidden), dtype=torch.bfloat16) - 0.5).float() for _ in range(num_experts)
     ]
+    # Permute each gate_up weight into per-core [gate_64 | up_64] blocks so each [H, 128]
+    # shard holds everything a core needs for its SwiGLU output slice in one NoC read.
+    gate_up_perm = [_interleave_gate_up(w) for w in gate_up_weights]
 
     def to_tt(t, layout, dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG):
         return ttnn.from_torch(t, dtype=dtype, device=device, layout=layout, memory_config=memory_config)
@@ -95,38 +116,52 @@ def test_fused_experts_expert_ids(device, hidden, intermediate, num_experts, num
     dram_core_ranges = [
         ttnn.CoreRange(ttnn.CoreCoord(bank_id, 0), ttnn.CoreCoord(bank_id, 0)) for bank_id in range(BH_NUM_DRAM_BANKS)
     ]
-
     dram_core_range_set = ttnn.CoreRangeSet(dram_core_ranges)
 
-    gate_up_mem_config = _nd_sharded_dram_memory_config(hidden, 2 * intermediate, dram_core_range_set)
-    down_mem_config = _nd_sharded_dram_memory_config(intermediate, hidden, dram_core_range_set)
-
-    print(dram_core_range_set)
-    print(gate_up_mem_config)
-    print(down_mem_config)
-    tt_routing_weights = ttnn.from_torch(
-        routing_4d,
-        dtype=ttnn.bfloat16,
-        device=device,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    # Each gate_up shard is one core's [H, 128] (gate 64 | up 64) slice.
+    gate_up_mem_config = _nd_sharded_dram_memory_config(
+        hidden, two_intermediate, 2 * COLS_PER_CORE, dram_core_range_set
     )
-    tt_gate_up_weights = [
-        to_tt(w, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat4_b, memory_config=gate_up_mem_config) for w in gate_up_weights
-    ]
-    tt_down_weights = [
-        to_tt(w, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat4_b, memory_config=down_mem_config) for w in down_weights
-    ]
-    for i in range(4):
-        tt_out = ttnn.experimental.deepseek.moe.fused_experts(
-            to_tt(x_flat, ttnn.TILE_LAYOUT),
-            routing_weights=tt_routing_weights,
-            gate_up_weights=tt_gate_up_weights,
-            down_weights=tt_down_weights,
-            intermediate_size=intermediate,
-            swiglu_limit=limit,
-        )
+    down_mem_config = _nd_sharded_dram_memory_config(
+        intermediate, hidden, hidden // FUSED_EXPERTS_NUM_CORES, dram_core_range_set
+    )
 
-    got_ids = ttnn.to_torch(tt_out).flatten().to(torch.int64).tolist()
+    x_tt = to_tt(x_flat, ttnn.TILE_LAYOUT)
+    gate_up_tt = [
+        to_tt(w, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat4_b, memory_config=gate_up_mem_config) for w in gate_up_perm
+    ]
+    down_tt = [to_tt(w, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat4_b, memory_config=down_mem_config) for w in down_weights]
 
-    assert got_ids == expected_ids, f"expert ids mismatch: got {got_ids}, expected {expected_ids}"
+    tt_out = ttnn.experimental.deepseek.moe.fused_experts(
+        x_tt,
+        routing_weights=ttnn.from_torch(
+            routing_4d,
+            dtype=ttnn.bfloat16,
+            device=device,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        ),
+        gate_up_weights=gate_up_tt,
+        down_weights=down_tt,
+        num_experts=num_nonzero,
+        intermediate_size=intermediate,
+        swiglu_limit=limit,
+    )
+
+    out_torch = ttnn.to_torch(tt_out).float()  # [num_active, 1, I]
+    assert list(out_torch.shape) == [num_nonzero, 1, intermediate], f"unexpected output shape {out_torch.shape}"
+
+    # Only the routing-selected experts are computed; output row i == hit_ids[i].
+    # Reference from the original (full-precision) torch weights; the device path adds
+    # bf16 input rounding and bf4 weight quantization, so PCC (not exact match) is checked.
+    x_dev = ttnn.to_torch(x_tt).float().reshape(tokens, hidden)
+    failures = []
+    for i, e in enumerate(hit_ids):
+        gu = (x_dev @ gate_up_weights[e]).reshape(tokens, two_intermediate)  # [1, 2I]
+        ref_e = _swiglu(gu, intermediate, limit)  # [1, I]
+        got_e = out_torch[i, :tokens, :]
+        passing, pcc_msg = comp_pcc(ref_e, got_e, pcc=0.99)
+        if not passing:
+            failures.append(f"row {i} (expert {e}): {pcc_msg} | {comp_allclose(ref_e, got_e)}")
+
+    assert not failures, "gate_up + SwiGLU output mismatch:\n" + "\n".join(failures)
