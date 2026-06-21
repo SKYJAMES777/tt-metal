@@ -20,14 +20,16 @@ void bind_fused_experts(nb::module_& mod) {
         ``routing_weights``: the i-th weight pair is scaled by ``routing_weights`` column i,
         so experts with zero routing weight contribute nothing (no host-side expert-id list).
 
-        CURRENT MILESTONE: runs the gate_up matmul + SwiGLU activation on device for the
-        routing-selected experts and returns a [num_experts, 1, I] BFLOAT16 TILE tensor, where
-        output[i] = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit) and [gate, up] =
-        x @ gate_up_w[hit_ids[i]]; hit_ids are the nonzero ``routing_weights`` columns in ascending
-        order. The gate_up weights must be DRAM ND-sharded so each shard is one core's [H, 64] slice,
-        with gate/up columns interleaved at tile granularity so each shard is a [gate_tile | up_tile]
-        pair (read in a single NoC read). ``input_tensor`` must be TILE layout and ``routing_weights``
-        ROW_MAJOR bfloat16. Down matmul + routed accumulation are later milestones.
+        CURRENT MILESTONE: runs the gate_up matmul + SwiGLU activation + down matmul on device for
+        the routing-selected experts and returns a [num_experts, 1, H] BFLOAT16 TILE tensor, where
+        act = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit), [gate, up] = x @ gate_up_w[hit_ids[i]],
+        and output[i] = act @ down_w[hit_ids[i]]; hit_ids are the nonzero ``routing_weights`` columns
+        in ascending order. The gate_up weights must be DRAM ND-sharded so each shard is one core's
+        [H, 64] slice (gate/up columns interleaved at tile granularity), and the down weights DRAM
+        ND-sharded so each shard is one core's [I, H/64] slice — both read in a single NoC read. The
+        SwiGLU activation is gathered onto core {0,0} and broadcast to every core for the down matmul.
+        ``input_tensor`` must be TILE layout and ``routing_weights`` ROW_MAJOR bfloat16. Routing-weight
+        scaling + cross-expert accumulation are later milestones.
 
         Args:
             input_tensor: Activations, [1, 1, 1, H].

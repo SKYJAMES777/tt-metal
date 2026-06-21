@@ -7,94 +7,264 @@
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
 #include "api/dataflow/circular_buffer.h"
+#include "api/dataflow/endpoints.h"
+#include "api/dataflow/noc_semaphore.h"
 #include "api/core_local_mem.h"
 #include "api/tensor/noc_traits.h"
 #include "api/tensor/tensor_accessor.h"
 
-// Per-core gate_up weight fetch (shared by all kernels in this op).
+// Shared dataflow helpers for the fused-experts pipeline (used by every DM kernel).
 //
-// Each active core owns a 2-tile (64 column) slice of the SwiGLU output I dimension:
-// output tiles [col_start_tile, col_start_tile + 1]. Computing that SwiGLU slice needs
-// both the gate columns [64c, 64c+64) and the paired up columns [I+64c, I+64c+64) of
-// the [K, 2I] gate_up weight (c == this core's index).
+// PER-EXPERT PIPELINE (run by the reader on every core, in lock-step across the chip):
+//   1. gate_up matmul + SwiGLU produces, on each of the 32 SwiGLU cores, a 2-tile
+//      (64-column) slice of the activation act[1, I] (its I-columns [idx*64, idx*64+64)).
+//   2. GATHER: each SwiGLU core's writer copies its 2 act tiles into core {0,0}'s cb_act
+//      at tile offset idx*2 (a single NoC write to the leader) and bumps the leader's
+//      gather semaphore. After all 32 chunks land, {0,0}'s cb_act holds the full act[1, I]
+//      (i_tiles == I/32 tiles, in K order).
+//   3. BROADCAST: {0,0} multicasts its full cb_act to every other core's cb_act (same L1
+//      address) and sets the broadcast semaphore. Now every core has the full activation.
+//   4. DOWN matmul: each of the 64 cores multiplies the full act[1, I] by its own down
+//      weight shard ([I, H/64] -> down_slice_tiles tiles) to produce its 2-tile (64-column)
+//      slice of the output row[1, H], written to the [num_active, 1, H] DRAM output.
 //
-// To keep all of that in one DRAM shard, the gate_up weight is reshaped+permuted on
-// the host into per-core [gate_64 | up_64] blocks, so each shard is this core's
-// [K, 128] slice (shard shape [K, 128] in elements -> [k_tiles, 4] in tiles: tile cols
-// 0,1 == gate, tile cols 2,3 == up). The shards are round-robin distributed across the
-// DRAM banks with contiguous pages, so this core's entire gate+up weight for one
-// expert is pulled in a *single* NoC read. Shard id == this core's index ==
-// col_start_tile / 2.
-//
-// The op takes *all* experts' weights as input and uses the routing weights to
-// select which experts to run. The selected ("hit") expert ids are computed on
-// device and broadcast into cb_bcast as a compacted, ascending list; this core
-// fetches only those `num_active` experts. The i-th fetched shard belongs to
-// expert ids[i], and feeds the i-th output row (matmul + writer loop in lock-step).
-//
-// Arguments:
-//   noc               NoC instance to use for the reads.
-//   cb_bcast_id       CB holding the broadcast hit-expert ids (ascending).
-//   cb_weights_id     CB receiving this core's weight slice (producer side).
-//   num_active        Number of routing-selected experts to run.
-//   k_tiles           K / 32 (number of tile rows of the weight).
-//   i_tiles           I / 32 (SwiGLU output tile cols; cores past it are idle).
-//   tile_bytes        Size of one tile in bytes.
-//   col_start_tile    This core's first SwiGLU output tile (= compute_index * 2).
-//   gate_up_args      Shared TensorAccessorArgs (all experts share one layout).
-//   rt_w_addr_base    Runtime-arg index of the first gate_up base address.
-// The activation row is delivered into every core's cb_input L1 region by the
-// input broadcaster's multicast (receivers) or by a direct DRAM read (the
-// broadcaster itself). Advancing cb_input by k_tiles pages publishes it to the
-// matmul compute kernel. Receivers call this once the input-ready semaphore fires.
+// cb_act is single-buffered, so experts are processed one at a time: the leader only
+// broadcasts expert e once every core has finished consuming expert e-1's activation
+// (tracked by the actfree semaphore the writers bump after the down output is written).
+
+// The activation row is delivered into every core's cb_input L1 region by the input
+// broadcaster's multicast (receivers) or by a direct DRAM read (the broadcaster itself).
+// Advancing cb_input by k_tiles pages publishes it to the matmul compute kernel.
 inline void publish_input(uint32_t cb_input_id, uint32_t k_tiles) {
     CircularBuffer cb_input(cb_input_id);
     cb_input.reserve_back(k_tiles);
     cb_input.push_back(k_tiles);
 }
 
+// gate_up weight layout: each SwiGLU core owns a 2-tile (64-column) slice of the SwiGLU
+// output I dim, needing the gate columns [64c, 64c+64) and paired up columns
+// [I+64c, I+64c+64) of the [K, 2I] weight. The host permutes the weight into per-core
+// [gate_64 | up_64] blocks so each DRAM shard is this core's [K, 128] slice (tile cols
+// 0,1 == gate, 2,3 == up), read in one NoC read. Shard id == col_start_tile / 2.
+constexpr uint32_t kOutTilesPerCore = 2;
+constexpr uint32_t kGateUpShardTileCols = 2 * kOutTilesPerCore;  // gate 2 | up 2
+
+// Read this core's gate_up slice for the i-th selected ("hit") expert into cb_weights.
 template <typename GateUpArgs>
-void fetch_gate_up_slices(
+inline void fetch_gate_up_one(
     const Noc& noc,
     uint32_t cb_bcast_id,
     uint32_t cb_weights_id,
-    uint32_t num_active,
+    uint32_t i,
     uint32_t k_tiles,
-    uint32_t i_tiles,
     uint32_t tile_bytes,
-    uint32_t col_start_tile,
+    uint32_t shard_id,
     const GateUpArgs& gate_up_args,
     uint32_t rt_w_addr_base) {
-    // Cores whose SwiGLU output slice falls outside I do nothing.
-    if (col_start_tile >= i_tiles) {
-        return;
-    }
-
-    // The shard is this core's 2 output tiles' gate (tiles 0,1) + up (tiles 2,3) = 4 tile cols.
-    constexpr uint32_t kOutTilesPerCore = 2;
-    constexpr uint32_t kShardTileCols = 2 * kOutTilesPerCore;  // gate 2 | up 2
-    const uint32_t slice_tiles = k_tiles * kShardTileCols;
-    // One DRAM shard == this core's whole [K, 128] gate+up slice; read it in one shot.
+    const uint32_t slice_tiles = k_tiles * kGateUpShardTileCols;
     const uint32_t slice_bytes = slice_tiles * tile_bytes;
-    const uint32_t shard_id = col_start_tile / kOutTilesPerCore;
 
-    // The hit-expert ids were broadcast into cb_bcast (ascending, compacted at the
-    // front). cb_bcast is never advanced, so the ids live at its write pointer.
     CircularBuffer cb_bcast(cb_bcast_id);
     CoreLocalMem<volatile uint32_t> ids(cb_bcast.get_write_ptr());
+    const uint32_t expert = ids[i];
+    const uint32_t w_addr = get_arg_val<uint32_t>(rt_w_addr_base + expert);
+    const auto w = TensorAccessor(gate_up_args, w_addr);
 
     CircularBuffer cb_weights(cb_weights_id);
+    cb_weights.reserve_back(slice_tiles);
+    ShardView w_shard(w);
+    noc.async_read(w_shard, cb_weights, slice_bytes, {.shard_id = shard_id}, {.offset_bytes = 0});
+    noc.async_read_barrier();
+    cb_weights.push_back(slice_tiles);
+}
 
-    for (uint32_t i = 0; i < num_active; ++i) {
-        const uint32_t expert = ids[i];
-        const uint32_t w_addr = get_arg_val<uint32_t>(rt_w_addr_base + expert);
-        const auto w = TensorAccessor(gate_up_args, w_addr);
+// Read this core's down weight slice for the i-th selected expert into cb_down_w.
+//
+// down weights are [I, H] per expert, DRAM ND-sharded into [I, H/64] column blocks (one
+// per core). Core idx owns the H output columns [idx*64, idx*64+64) -> its 2 output tiles,
+// and needs the full I (K) dim, so its shard is [down_k_tiles, 2] tiles == down_slice_tiles.
+// Shard id == col_start_tile / 2 == idx. Read in one NoC read.
+template <typename DownArgs>
+inline void fetch_down_one(
+    const Noc& noc,
+    uint32_t cb_bcast_id,
+    uint32_t cb_down_w_id,
+    uint32_t i,
+    uint32_t down_slice_tiles,
+    uint32_t down_tile_bytes,
+    uint32_t shard_id,
+    const DownArgs& down_args,
+    uint32_t rt_down_addr_base) {
+    const uint32_t slice_bytes = down_slice_tiles * down_tile_bytes;
 
-        // Single NoC read of this expert's entire shard for this core.
-        cb_weights.reserve_back(slice_tiles);
-        ShardView w_shard(w);
-        noc.async_read(w_shard, cb_weights, slice_bytes, {.shard_id = shard_id}, {.offset_bytes = 0});
-        noc.async_read_barrier();
-        cb_weights.push_back(slice_tiles);
+    CircularBuffer cb_bcast(cb_bcast_id);
+    CoreLocalMem<volatile uint32_t> ids(cb_bcast.get_write_ptr());
+    const uint32_t expert = ids[i];
+    const uint32_t w_addr = get_arg_val<uint32_t>(rt_down_addr_base + expert);
+    const auto w = TensorAccessor(down_args, w_addr);
+
+    CircularBuffer cb_down_w(cb_down_w_id);
+    cb_down_w.reserve_back(down_slice_tiles);
+    ShardView w_shard(w);
+    noc.async_read(w_shard, cb_down_w, slice_bytes, {.shard_id = shard_id}, {.offset_bytes = 0});
+    noc.async_read_barrier();
+    cb_down_w.push_back(down_slice_tiles);
+}
+
+// Leader ({0,0}) side of the act gather + broadcast for one expert.
+//
+// Sequence (cumulative semaphore thresholds avoid per-expert resets and their races):
+//   1. Wait for every core to have freed cb_act from the previous expert (actfree) so the
+//      single-buffered cb_act -- which the leader uses as the gather sink AND the local
+//      compute input -- is safe to overwrite.
+//   2. Reserve cb_act and signal the SwiGLU cores (gather_ready) that they may now scatter
+//      their activation chunk into the leader's cb_act for this expert. Gating the scatter
+//      on this avoids producers clobbering the leader's still-in-use cb_act.
+//   3. Wait for all `num_producers` chunks to land (gather).
+//   4. Multicast the full activation to every other core's cb_act (broadcast) and publish it
+//      to the local compute kernel.
+inline void leader_gather_broadcast(
+    const Noc& noc,
+    uint32_t cb_act_id,
+    uint32_t i_tiles,
+    uint32_t act_tile_bytes,
+    uint32_t e,
+    uint32_t num_producers,
+    uint32_t num_cores,
+    uint32_t sem_gather_id,
+    uint32_t sem_bcast_id,
+    uint32_t sem_actfree_id,
+    uint32_t sem_gather_ready_id,
+    uint32_t mcast_start_x,
+    uint32_t mcast_start_y,
+    uint32_t mcast_end_x,
+    uint32_t mcast_end_y,
+    uint32_t num_dests) {
+    if (e > 0) {
+        Semaphore<>(sem_actfree_id).wait_min(num_cores * e);
+    }
+
+    CircularBuffer cb_act(cb_act_id);
+    cb_act.reserve_back(i_tiles);
+    const uint32_t act_l1 = cb_act.get_write_ptr();
+
+    // cb_act is free now -> let the SwiGLU cores scatter their chunks for this expert.
+    Semaphore<> ready(sem_gather_ready_id);
+    ready.set(e + 1);
+    ready.set_multicast(noc, mcast_start_x, mcast_start_y, mcast_end_x, mcast_end_y, num_dests, /*linked=*/false);
+
+    Semaphore<>(sem_gather_id).wait_min(num_producers * (e + 1));
+
+    noc.async_write_multicast(
+        CoreLocalMem<uint32_t>(act_l1),
+        MulticastEndpoint{},
+        i_tiles * act_tile_bytes,
+        num_dests,
+        {.offset_bytes = 0},
+        {.noc_x_start = mcast_start_x,
+         .noc_y_start = mcast_start_y,
+         .noc_x_end = mcast_end_x,
+         .noc_y_end = mcast_end_y,
+         .addr = act_l1},
+        /*linked=*/false);
+    noc.async_write_barrier();
+
+    Semaphore<> sem(sem_bcast_id);
+    sem.set(e + 1);
+    sem.set_multicast(noc, mcast_start_x, mcast_start_y, mcast_end_x, mcast_end_y, num_dests, /*linked=*/false);
+
+    cb_act.push_back(i_tiles);
+}
+
+// Non-leader side: wait for the leader's broadcast of expert e's activation, then publish
+// the (already-resident) full activation to the local compute kernel.
+inline void receiver_recv_act(uint32_t cb_act_id, uint32_t i_tiles, uint32_t e, uint32_t sem_bcast_id) {
+    Semaphore<>(sem_bcast_id).wait_min(e + 1);
+    CircularBuffer cb_act(cb_act_id);
+    cb_act.reserve_back(i_tiles);
+    cb_act.push_back(i_tiles);
+}
+
+// Per-core reader loop shared by all DM reader kernels. For each selected expert it fetches
+// this core's gate_up slice (SwiGLU cores only) and down slice (all cores), then drives the
+// activation gather/broadcast (leader) or receives it (everyone else).
+template <bool IsLeader, typename GateUpArgs, typename DownArgs>
+inline void run_reader_loop(
+    const Noc& noc,
+    uint32_t num_active,
+    uint32_t col_start_tile,
+    uint32_t i_tiles,
+    uint32_t k_tiles,
+    uint32_t gate_up_tile_bytes,
+    uint32_t down_slice_tiles,
+    uint32_t down_tile_bytes,
+    uint32_t act_tile_bytes,
+    uint32_t num_producers,
+    uint32_t num_cores,
+    uint32_t cb_bcast_id,
+    uint32_t cb_weights_id,
+    uint32_t cb_down_w_id,
+    uint32_t cb_act_id,
+    uint32_t sem_gather_id,
+    uint32_t sem_bcast_id,
+    uint32_t sem_actfree_id,
+    uint32_t sem_gather_ready_id,
+    uint32_t mcast_start_x,
+    uint32_t mcast_start_y,
+    uint32_t mcast_end_x,
+    uint32_t mcast_end_y,
+    uint32_t num_dests,
+    const GateUpArgs& gate_up_args,
+    uint32_t rt_gu_addr_base,
+    const DownArgs& down_args,
+    uint32_t rt_down_addr_base) {
+    const bool swiglu_core = col_start_tile < i_tiles;
+    const uint32_t shard_id = col_start_tile / kOutTilesPerCore;
+
+    for (uint32_t e = 0; e < num_active; ++e) {
+        if (swiglu_core) {
+            fetch_gate_up_one(
+                noc,
+                cb_bcast_id,
+                cb_weights_id,
+                e,
+                k_tiles,
+                gate_up_tile_bytes,
+                shard_id,
+                gate_up_args,
+                rt_gu_addr_base);
+        }
+        fetch_down_one(
+            noc,
+            cb_bcast_id,
+            cb_down_w_id,
+            e,
+            down_slice_tiles,
+            down_tile_bytes,
+            shard_id,
+            down_args,
+            rt_down_addr_base);
+
+        if constexpr (IsLeader) {
+            leader_gather_broadcast(
+                noc,
+                cb_act_id,
+                i_tiles,
+                act_tile_bytes,
+                e,
+                num_producers,
+                num_cores,
+                sem_gather_id,
+                sem_bcast_id,
+                sem_actfree_id,
+                sem_gather_ready_id,
+                mcast_start_x,
+                mcast_start_y,
+                mcast_end_x,
+                mcast_end_y,
+                num_dests);
+        } else {
+            receiver_recv_act(cb_act_id, i_tiles, e, sem_bcast_id);
+        }
     }
 }

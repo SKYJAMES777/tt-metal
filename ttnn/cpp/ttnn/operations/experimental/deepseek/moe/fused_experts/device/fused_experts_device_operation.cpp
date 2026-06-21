@@ -87,6 +87,52 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_miss(
             shard_shape[-2]);
     }
 
+    // down weights must be DRAM ND-sharded so each shard is exactly one core's [I, H/64]
+    // column slice (read in a single NoC read). Each shard spans the full I (contraction) dim
+    // and one core's 64-column H output slice; H/64 shards cover the output H dim.
+    const uint32_t hidden = static_cast<uint32_t>(x.logical_shape()[-1]);
+    constexpr uint32_t kNumCores = 64;  // 8x8 compute grid
+    TT_FATAL(
+        hidden % kNumCores == 0,
+        "fused_experts: hidden dim ({}) must be divisible by the {}-core grid",
+        hidden,
+        kNumCores);
+    const uint32_t down_shard_cols = hidden / kNumCores;
+    for (uint32_t e = 0; e < num_weights; ++e) {
+        const auto& w = tensor_args.down_weights[e];
+        TT_FATAL(
+            w.buffer()->buffer_type() == tt::tt_metal::BufferType::DRAM,
+            "fused_experts: down_weights[{}] must be in DRAM",
+            e);
+        const auto& nd = w.memory_config().nd_shard_spec();
+        TT_FATAL(nd.has_value(), "fused_experts: down_weights[{}] must be ND-sharded (one shard per core)", e);
+        const auto& shard_shape = nd->shard_shape;
+        TT_FATAL(
+            static_cast<uint32_t>(w.logical_shape()[-2]) == attributes.intermediate_size,
+            "fused_experts: down_weights[{}] K dim ({}) must equal intermediate_size ({})",
+            e,
+            w.logical_shape()[-2],
+            attributes.intermediate_size);
+        TT_FATAL(
+            static_cast<uint32_t>(w.logical_shape()[-1]) == hidden,
+            "fused_experts: down_weights[{}] output dim ({}) must equal hidden ({})",
+            e,
+            w.logical_shape()[-1],
+            hidden);
+        TT_FATAL(
+            static_cast<uint32_t>(shard_shape[-1]) == down_shard_cols,
+            "fused_experts: down_weights[{}] shard last dim ({}) must be {} (one core's H/64 slice)",
+            e,
+            shard_shape[-1],
+            down_shard_cols);
+        TT_FATAL(
+            static_cast<uint32_t>(shard_shape[-2]) == static_cast<uint32_t>(w.logical_shape()[-2]),
+            "fused_experts: down_weights[{}] shard must span the full I dim ({} rows), got {}",
+            e,
+            w.logical_shape()[-2],
+            shard_shape[-2]);
+    }
+
     // Decode-only: sequence length T == 1.
     TT_FATAL(
         static_cast<uint32_t>(x.logical_shape()[-2]) == 1,
@@ -119,16 +165,16 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_hit(
 
 FusedExpertsDeviceOperation::spec_return_value_t FusedExpertsDeviceOperation::compute_output_specs(
     const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
-    (void)tensor_args;
-    // The output holds the gate_up matmul + SwiGLU activation for the routing-selected
-    // experts in ascending hit-id order:
-    //   output[i] = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit),
-    //   where [gate, up] = x @ gate_up_w[hit_ids[i]].
-    // Shape [num_experts, 1, I] (decode token row, padded to a 32-row tile in TILE
-    // layout), BFLOAT16.
+    // The output holds the down matmul result for the routing-selected experts in ascending
+    // hit-id order:
+    //   act       = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit),
+    //               where [gate, up] = x @ gate_up_w[hit_ids[i]];
+    //   output[i] = act @ down_w[hit_ids[i]].
+    // Shape [num_experts, 1, H] (decode token row, padded to a 32-row tile in TILE layout),
+    // BFLOAT16. H is the hidden size (== down weight output dim == input hidden dim).
     const uint32_t num_experts = attributes.num_experts;
-    const uint32_t intermediate = attributes.intermediate_size;
-    const ttnn::Shape output_shape({num_experts, 1, intermediate});
+    const uint32_t hidden = static_cast<uint32_t>(tensor_args.input_tensor.logical_shape()[-1]);
+    const ttnn::Shape output_shape({num_experts, 1, hidden});
     return TensorSpec(
         output_shape,
         tt::tt_metal::TensorLayout(

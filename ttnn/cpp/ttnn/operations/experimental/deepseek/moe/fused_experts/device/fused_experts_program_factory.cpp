@@ -31,17 +31,21 @@ constexpr uint32_t kTilesPerCore = 2;
 uint32_t align_up_32(uint32_t x) { return (x + 31u) & ~31u; }
 }  // namespace
 
-// Pipeline:
+// Pipeline (per selected expert, all cores in lock-step):
 //   - {0,0} (NoC 0) reads routing weights, computes/broadcasts the selected ("hit")
-//     expert ids (ascending), and fetches its gate_up slices for those experts.
+//     expert ids (ascending), and acts as the activation-gather leader.
 //   - {1,0} (NoC 1) reads the decode activation row and broadcasts it to every
-//     core's L1 (cb_input), then fetches its gate_up slices.
-//   - Each active core fetches its [K, 128] gate_up shard (one NoC read each) -- the
-//     per-core [gate_64 | up_64] block holding its 2 gate tiles and their paired up
-//     tiles -- for each of the num_active selected experts. The compute kernel runs the
-//     gate_up matmul and the fused SwiGLU activation, producing this core's 2 output
-//     tiles per expert, and the writer writes them to the [num_active, 1, I] DRAM
-//     output, one output row per selected expert.
+//     core's L1 (cb_input).
+//   - gate_up + SwiGLU: each of the 32 SwiGLU cores fetches its [K, 128] gate_up shard
+//     (one NoC read -- a per-core [gate_64 | up_64] block) and produces its 2-tile slice
+//     of the activation act[1, I].
+//   - GATHER + BROADCAST: each SwiGLU core's writer scatters its 2 act tiles to {0,0}'s
+//     cb_act (at tile offset col_start); once {0,0} has all 32 chunks it multicasts the
+//     full act[1, I] back to every core (sem_gather / sem_bcast / sem_actfree sequence).
+//   - DOWN matmul: each of the 64 cores fetches its [I, H/64] down shard (one NoC read)
+//     and multiplies it by the full activation to produce its 2-tile slice of the output
+//     row[1, H], which the writer writes to the [num_active, 1, H] DRAM output (one row
+//     per selected expert).
 ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const operation_attributes_t& operation_attributes,
     const tensor_args_t& tensor_args,
@@ -89,6 +93,23 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     // Double-buffer the weight slice so the reader can prefetch the next expert.
     const uint32_t weights_cb_bytes = 2u * weight_slice_tiles * weight_tile_bytes;
 
+    // down weights are [I, H] per expert (TILE layout), DRAM ND-sharded into [I, H/64]
+    // column blocks (one per core). Core idx owns the H output cols [idx*64, idx*64+64) ->
+    // its 2 output tiles, and needs the full I (== gate_up output) contraction dim, so its
+    // shard is [i_tiles, 2] tiles. All experts share one layout, so weight 0's accessor is
+    // reused (the fetch indexes by shard id == this core's index).
+    const auto& down0 = tensor_args.down_weights.front();
+    auto* down0_buffer = down0.buffer();
+    const uint32_t down_n_tiles = static_cast<uint32_t>(down0.logical_shape()[-1]) / TILE_DIM;  // H / 32
+    const uint32_t down_slice_tiles = i_tiles * kTilesPerCore;  // [I, 64] = i_tiles * 2 tiles
+    const uint32_t down_tile_bytes = static_cast<uint32_t>(down0_buffer->page_size());
+    const uint32_t down_cb_bytes = 2u * down_slice_tiles * down_tile_bytes;  // double-buffered
+    const tt::DataFormat down_df = datatype_to_dataformat_converter(down0.dtype());
+
+    // Number of SwiGLU cores (each produces one [1, 64] activation chunk) and the full grid.
+    const uint32_t num_producers = i_tiles / kTilesPerCore;  // I / 64
+    const uint32_t num_cores = GRID_X * GRID_Y;
+
     const tt::DataFormat gate_up_df = datatype_to_dataformat_converter(gate_up0.dtype());
     const tt::DataFormat routing_df = datatype_to_dataformat_converter(routing_weights.dtype());
     const tt::DataFormat out_df = datatype_to_dataformat_converter(output_tensor.dtype());
@@ -104,11 +125,14 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const uint32_t input_page_size = static_cast<uint32_t>(input_buffer->page_size());
     const uint32_t input_num_pages = static_cast<uint32_t>(input_buffer->num_pages());
 
-    // Output is TILE [num_active, 1, I] bf16 (the SwiGLU activation): each active core
-    // writes its 2 output tiles (its 64-column I slice) per expert. i_tiles == I/32 is
-    // both the output page stride per expert row and the idle-core guard.
+    // Output is TILE [num_active, 1, H] bf16 (the down matmul result): each core writes its
+    // 2 output tiles (its 64-column H slice) per expert. h_tiles == H/32 is the output page
+    // stride per expert row. The gathered activation is bf16 (== output dtype), so its tile
+    // size matches the output tile size.
 
     const uint32_t out_tile_bytes = static_cast<uint32_t>(out_buffer->page_size());
+    const uint32_t h_tiles = down_n_tiles;           // H / 32
+    const uint32_t act_tile_bytes = out_tile_bytes;  // activation tile == bf16 output tile
 
     // SwiGLU clamp limit, passed to the compute kernel as a bit-cast float (the kernel
     // derives -limit internally).
@@ -125,6 +149,14 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     // 2*kOutTilesPerCore tiles per expert (gate 0,1 | up 2,3), single-buffered.
     const uint32_t mm_tile_bytes = TILE_DIM * TILE_DIM * 4u;
     const uint32_t mm_cb_bytes = 2u * kOutTilesPerCore * mm_tile_bytes;
+
+    // Gathered activation act[1, I] (i_tiles tiles), single-buffered: filled by the gather
+    // on {0,0} and by the broadcast on every other core, consumed by the down matmul. Single
+    // buffering serializes experts (the leader only broadcasts the next expert once all cores
+    // have freed it, via the actfree semaphore).
+    const uint32_t act_cb_bytes = i_tiles * act_tile_bytes;
+    // Per-core down output (kOutTilesPerCore tiles per expert), double-buffered.
+    const uint32_t down_out_cb_bytes = 2u * kOutTilesPerCore * out_tile_bytes;
 
     // Core sets: full grid, the two senders {0,0} (expert ids) and {1,0} (activations),
     // and the 62 receivers.
@@ -165,6 +197,25 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         .core_ranges = all_cores,
         .initial_value = 0,
     });
+    // Down-phase semaphores (all on {0,0}, but allocated on every core for a uniform id):
+    //   sem_gather  : SwiGLU cores bump it after scattering their activation chunk to {0,0}.
+    //   sem_bcast   : {0,0} sets it (== expert index + 1) after broadcasting the activation.
+    //   sem_actfree : every core bumps it after consuming the gathered activation (down done),
+    //                 telling {0,0} the single-buffered cb_act may be reused for the next expert.
+    //   sem_gather_ready : {0,0} sets it (== expert index + 1) once cb_act is free, telling the
+    //                 SwiGLU cores they may scatter their chunk for the next expert.
+    constexpr uint32_t sem_gather_id = 2;
+    constexpr uint32_t sem_bcast_id = 3;
+    constexpr uint32_t sem_actfree_id = 4;
+    constexpr uint32_t sem_gather_ready_id = 5;
+    for (uint32_t s : {sem_gather_id, sem_bcast_id, sem_actfree_id, sem_gather_ready_id}) {
+        desc.semaphores.push_back(SemaphoreDescriptor{
+            .id = s,
+            .core_type = CoreType::WORKER,
+            .core_ranges = all_cores,
+            .initial_value = 0,
+        });
+    }
 
     // CBs are allocated identically on all cores so the broadcast CBs land at the same
     // L1 address everywhere (required for the multicast writes to be valid).
@@ -240,6 +291,43 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         }}},
     });
 
+    // Gathered activation (full act[1, I], i_tiles tiles), single-buffered. Allocated
+    // identically on all cores so the gather scatter / broadcast land at the same L1 address.
+    constexpr uint32_t cb_act = CBIndex::c_6;
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = act_cb_bytes,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_act,
+            .data_format = out_df,
+            .page_size = act_tile_bytes,
+        }}},
+    });
+
+    // Per-core down weight slice ([I, 64] = i_tiles x 2 tiles), double-buffered.
+    constexpr uint32_t cb_down_weights = CBIndex::c_7;
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = down_cb_bytes,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_down_weights,
+            .data_format = down_df,
+            .page_size = down_tile_bytes,
+        }}},
+    });
+
+    // Per-core down output (kOutTilesPerCore tiles per expert), double-buffered.
+    constexpr uint32_t cb_down_out = CBIndex::c_8;
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = down_out_cb_bytes,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_down_out,
+            .data_format = out_df,
+            .page_size = out_tile_bytes,
+        }}},
+    });
+
     // Multicast rectangle (NoC coords) covering the whole grid. Non-loopback
     // multicast excludes the sender, so num_dests = total cores - 1.
     const auto corner_a = device->worker_core_from_logical_core(CoreCoord{0, 0});
@@ -261,31 +349,38 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     for (const auto& w : tensor_args.gate_up_weights) {
         gate_up_addrs.push_back(static_cast<uint32_t>(w.buffer()->address()));
     }
+    // down weight base addresses, in expert-id order (indexed by routing-selected hit id),
+    // appended to the runtime args right after the gate_up addresses.
+    std::vector<uint32_t> down_addrs;
+    down_addrs.reserve(num_weights);
+    for (const auto& w : tensor_args.down_weights) {
+        down_addrs.push_back(static_cast<uint32_t>(w.buffer()->address()));
+    }
     auto append_addrs = [&](KernelDescriptor::CoreRuntimeArgs& args) {
         for (uint32_t a : gate_up_addrs) {
             args.push_back(a);
         }
+        for (uint32_t a : down_addrs) {
+            args.push_back(a);
+        }
     };
+
+    // Core {0,0} NoC coordinates (virtual; usable on either NoC) — the gather scatter target
+    // and the home of the down-phase semaphores.
+    const uint32_t leader_noc_x = corner_a.x;
+    const uint32_t leader_noc_y = corner_a.y;
 
     // ---- Expert-id sender kernel on {0,0} (NoC 0). ----
     std::vector<uint32_t> sender_ct_args = {
-        num_weights,
-        num_active,
-        sentinel,
-        cb_routing,
-        cb_bcast,
-        routing_page_bytes,
-        bcast_page_bytes,
-        sem_id,
-        cb_weights,
-        k_tiles,
-        i_tiles,
-        weight_tile_bytes,
-        sem_input_id,
-        cb_input,
+        num_weights,         num_active,    sentinel,        cb_routing,    cb_bcast,         routing_page_bytes,
+        bcast_page_bytes,    sem_id,        cb_weights,      k_tiles,       i_tiles,          weight_tile_bytes,
+        sem_input_id,        cb_input,      cb_down_weights, cb_act,        down_slice_tiles, down_tile_bytes,
+        act_tile_bytes,      num_producers, num_cores,       sem_gather_id, sem_bcast_id,     sem_actfree_id,
+        sem_gather_ready_id,
     };
     TensorAccessorArgs(*routing_buffer).append_to(sender_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(sender_ct_args);
+    TensorAccessorArgs(*down0_buffer).append_to(sender_ct_args);
 
     KernelDescriptor sender_desc;
     sender_desc.kernel_source = std::string(kKernelDir) + "/dataflow/compute_expert_ids.cpp";
@@ -324,9 +419,22 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         i_tiles,
         weight_tile_bytes,
         cb_bcast,
+        cb_down_weights,
+        cb_act,
+        down_slice_tiles,
+        down_tile_bytes,
+        act_tile_bytes,
+        num_producers,
+        num_cores,
+        sem_gather_id,
+        sem_bcast_id,
+        sem_actfree_id,
+        num_weights,
+        sem_gather_ready_id,
     };
     TensorAccessorArgs(*input_buffer).append_to(input_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(input_ct_args);
+    TensorAccessorArgs(*down0_buffer).append_to(input_ct_args);
 
     KernelDescriptor input_sender_desc;
     input_sender_desc.kernel_source = std::string(kKernelDir) + "/dataflow/broadcast_input.cpp";
@@ -364,8 +472,21 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         i_tiles,
         weight_tile_bytes,
         cb_bcast,
+        cb_down_weights,
+        cb_act,
+        down_slice_tiles,
+        down_tile_bytes,
+        act_tile_bytes,
+        num_producers,
+        num_cores,
+        sem_gather_id,
+        sem_bcast_id,
+        sem_actfree_id,
+        num_weights,
+        sem_gather_ready_id,
     };
     TensorAccessorArgs(*gate_up0_buffer).append_to(receiver_ct_args);
+    TensorAccessorArgs(*down0_buffer).append_to(receiver_ct_args);
 
     KernelDescriptor receiver_desc;
     receiver_desc.kernel_source = std::string(kKernelDir) + "/dataflow/wait_expert_ids.cpp";
@@ -395,6 +516,9 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         cb_mm,
         cb_out,
         limit_bits,
+        cb_act,
+        cb_down_weights,
+        cb_down_out,
     };
     KernelDescriptor compute_desc;
     compute_desc.kernel_source = std::string(kKernelDir) + "/compute/matmul_gate_up.cpp";
@@ -416,9 +540,16 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     // ---- Writer kernel on all 64 cores (two processor groups). ----
     std::vector<uint32_t> writer_ct_args = {
         num_active,
-        i_tiles,  // I/32: output page stride per expert row and the out-of-range guard
+        i_tiles,  // I/32: SwiGLU-core guard for the gather scatter
+        h_tiles,  // H/32: output page stride per expert row
         cb_out,
+        cb_down_out,
+        cb_act,
+        act_tile_bytes,
         out_tile_bytes,
+        sem_gather_id,
+        sem_actfree_id,
+        sem_gather_ready_id,
     };
     TensorAccessorArgs(*out_buffer).append_to(writer_ct_args);
 
@@ -432,7 +563,9 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         for (const auto& cr : cores.ranges()) {
             for (const auto& core : cr) {
                 writer_desc.runtime_args.emplace_back(
-                    core, KernelDescriptor::CoreRuntimeArgs{out_buffer->address(), col_start_tile_for(core)});
+                    core,
+                    KernelDescriptor::CoreRuntimeArgs{
+                        out_buffer->address(), col_start_tile_for(core), leader_noc_x, leader_noc_y});
             }
         }
         desc.kernels.push_back(std::move(writer_desc));

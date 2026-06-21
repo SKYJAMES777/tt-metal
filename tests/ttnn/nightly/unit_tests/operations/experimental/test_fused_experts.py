@@ -2,22 +2,25 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit test for ttnn.experimental.deepseek.moe.fused_experts (gate_up + SwiGLU milestone).
+"""Unit test for ttnn.experimental.deepseek.moe.fused_experts (gate_up + SwiGLU + down milestone).
 
 The op takes *all* experts' weights and uses the routing weights to select which
 experts to run. For the routing-selected ("hit") experts, in ascending hit-id order,
-it computes the gate_up matmul *and* the SwiGLU gate on device:
+it computes the gate_up matmul, the SwiGLU gate, *and* the down matmul on device:
 
-    gu        = x @ gate_up_w[hit_ids[i]]                 # [1, H] @ [H, 2I] -> [1, 2I]
-    output[i] = silu(clamp(gu[:I], max=L)) * clamp(gu[I:], -L, L)   # -> [1, I]
+    gu        = x @ gate_up_w[hit_ids[i]]                          # [1, H] @ [H, 2I] -> [1, 2I]
+    act       = silu(clamp(gu[:I], max=L)) * clamp(gu[I:], -L, L)  # -> [1, I]
+    output[i] = act @ down_w[hit_ids[i]]                           # [1, I] @ [I, H] -> [1, H]
 
-The I output columns are distributed across the compute grid: each active core owns a
-2-tile (64-column) slice of the SwiGLU output and needs both the gate columns
-[64c, 64c+64) and the paired up columns [I+64c, I+64c+64) of the gate_up weight. To
-keep that data in a *single* DRAM shard (one NoC read), the gate_up weight is
-reshaped+permuted on the host into per-core [gate_64 | up_64] blocks, so each shard is
-a [H, 128] slice. The output tensor is [num_active, 1, I] in TILE layout (the decode
-token row padded to a 32-row tile), BFLOAT16.
+The I SwiGLU columns are distributed across the compute grid: each SwiGLU core owns a
+2-tile (64-column) slice and needs both the gate columns [64c, 64c+64) and the paired up
+columns [I+64c, I+64c+64) of the gate_up weight, kept in a *single* [H, 128] DRAM shard
+(host-permuted into per-core [gate_64 | up_64] blocks). The down matmul contracts over the
+full I, so each SwiGLU core scatters its activation slice to core {0,0}, which gathers the
+full activation and broadcasts it to every core; each core then multiplies it by its
+[I, H/64] down shard to produce its 64-column slice of the [1, H] output row. The output
+tensor is [num_active, 1, H] in TILE layout (the decode token row padded to a 32-row tile),
+BFLOAT16.
 
 Decode-only: sequence length T == 1.
 """
@@ -148,8 +151,8 @@ def test_fused_experts_gate_up(device, hidden, intermediate, num_experts, num_no
         swiglu_limit=limit,
     )
 
-    out_torch = ttnn.to_torch(tt_out).float()  # [num_active, 1, I]
-    assert list(out_torch.shape) == [num_nonzero, 1, intermediate], f"unexpected output shape {out_torch.shape}"
+    out_torch = ttnn.to_torch(tt_out).float()  # [num_active, 1, H]
+    assert list(out_torch.shape) == [num_nonzero, 1, hidden], f"unexpected output shape {out_torch.shape}"
 
     # Only the routing-selected experts are computed; output row i == hit_ids[i].
     # Reference from the original (full-precision) torch weights; the device path adds
@@ -158,10 +161,13 @@ def test_fused_experts_gate_up(device, hidden, intermediate, num_experts, num_no
     failures = []
     for i, e in enumerate(hit_ids):
         gu = (x_dev @ gate_up_weights[e]).reshape(tokens, two_intermediate)  # [1, 2I]
-        ref_e = _swiglu(gu, intermediate, limit)  # [1, I]
+        act = _swiglu(gu, intermediate, limit)  # [1, I]
+        ref_e = act @ down_weights[e]  # [1, I] @ [I, H] -> [1, H]
         got_e = out_torch[i, :tokens, :]
-        passing, pcc_msg = comp_pcc(ref_e, got_e, pcc=0.99)
+        # Two chained bfloat4_b matmuls (gate_up then down) compound the weight
+        # quantization error, so the PCC bar is slightly below the gate_up-only milestone.
+        passing, pcc_msg = comp_pcc(ref_e, got_e, pcc=0.98)
         if not passing:
             failures.append(f"row {i} (expert {e}): {pcc_msg} | {comp_allclose(ref_e, got_e)}")
 
-    assert not failures, "gate_up + SwiGLU output mismatch:\n" + "\n".join(failures)
+    assert not failures, "gate_up + SwiGLU + down output mismatch:\n" + "\n".join(failures)

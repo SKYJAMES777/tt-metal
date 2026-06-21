@@ -11,7 +11,7 @@
 
 #include "fetch_gate_up.h"
 
-// Expert-id sender kernel (runs on core {0,0}).
+// Expert-id sender + activation-gather leader kernel (runs on core {0,0}).
 //
 // 1. Reads the routing-weight row and computes the selected ("hit") expert ids on
 //    device (matching the host `hit = (rw.abs().sum(0) > 0).nonzero()`), compacted
@@ -19,32 +19,45 @@
 // 2. Multicasts the ids buffer to all other compute cores' L1 (cb_bcast).
 // 3. Sets + multicasts a semaphore (sem_id) to signal the other cores.
 // 4. Waits for the activation broadcast and publishes it to this core's compute.
-// 5. Fetches this core's gate_up weight slice for the `num_active` selected experts.
+// 5. Runs the per-expert reader loop as the LEADER: fetches this core's gate_up + down
+//    slices, gathers every SwiGLU core's activation chunk into the local cb_act, and
+//    broadcasts the full activation back to every core for the down matmul.
 //
 // Compile-time args:
 //   0: num_weights (total experts whose weights are provided; routing-row width)
-//   1: num_active  (routing-selected experts to run; fetch/matmul/writer loop count)
+//   1: num_active  (routing-selected experts to run)
 //   2: sentinel value for unused id slots (= num_weights)
 //   3: cb_routing  (L1 scratch for the routing-weight row)
 //   4: cb_bcast    (L1 buffer holding the expert ids; broadcast to all cores)
-//   5: routing_page_bytes (num_weights * sizeof(bfloat16))
-//   6: bcast_page_bytes    (num_weights * sizeof(uint32))
+//   5: routing_page_bytes
+//   6: bcast_page_bytes
 //   7: sem_id      (expert-ids-ready / sequencing semaphore)
-//   8: cb_weights  (this core's per-expert weight slice)
+//   8: cb_weights  (this core's per-expert gate_up slice)
 //   9: k_tiles     (H / 32)
-//   10: i_tiles    (I / 32, SwiGLU output tile cols)
-//   11: tile_bytes
+//   10: i_tiles    (I / 32)
+//   11: gate_up_tile_bytes
 //   12: sem_input_id (input-ready semaphore)
 //   13: cb_input     (activation tiles, published to compute)
-//   14+: TensorAccessorArgs(routing_weights), TensorAccessorArgs(gate_up)
+//   14: cb_down_w    (this core's per-expert down slice)
+//   15: cb_act       (gathered activation)
+//   16: down_slice_tiles
+//   17: down_tile_bytes
+//   18: act_tile_bytes
+//   19: num_producers (number of SwiGLU cores == I/64)
+//   20: num_cores     (compute grid size == 64)
+//   21: sem_gather
+//   22: sem_bcast
+//   23: sem_actfree
+//   24: sem_gather_ready
+//   25+: TensorAccessorArgs(routing_weights), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
 //
 // Runtime args:
 //   0: routing_weights base address
 //   1: mcast_start_x   2: mcast_start_y
 //   3: mcast_end_x     4: mcast_end_y
 //   5: num_dests       (number of receiver cores = total cores - 1)
-//   6: col_start_tile  (this core's first output N-tile)
-//   7+: gate_up base addresses (one per expert, in expert-id order)
+//   6: col_start_tile  (this core's first output tile)
+//   7 ..: gate_up base addresses (one per expert), then down base addresses (one per expert)
 void kernel_main() {
     constexpr uint32_t num_weights = get_compile_time_arg_val(0);
     constexpr uint32_t num_active = get_compile_time_arg_val(1);
@@ -57,12 +70,24 @@ void kernel_main() {
     constexpr uint32_t cb_weights_id = get_compile_time_arg_val(8);
     constexpr uint32_t k_tiles = get_compile_time_arg_val(9);
     constexpr uint32_t i_tiles = get_compile_time_arg_val(10);
-    constexpr uint32_t tile_bytes = get_compile_time_arg_val(11);
+    constexpr uint32_t gate_up_tile_bytes = get_compile_time_arg_val(11);
     constexpr uint32_t sem_input_id = get_compile_time_arg_val(12);
     constexpr uint32_t cb_input_id = get_compile_time_arg_val(13);
+    constexpr uint32_t cb_down_w_id = get_compile_time_arg_val(14);
+    constexpr uint32_t cb_act_id = get_compile_time_arg_val(15);
+    constexpr uint32_t down_slice_tiles = get_compile_time_arg_val(16);
+    constexpr uint32_t down_tile_bytes = get_compile_time_arg_val(17);
+    constexpr uint32_t act_tile_bytes = get_compile_time_arg_val(18);
+    constexpr uint32_t num_producers = get_compile_time_arg_val(19);
+    constexpr uint32_t num_cores = get_compile_time_arg_val(20);
+    constexpr uint32_t sem_gather_id = get_compile_time_arg_val(21);
+    constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(22);
+    constexpr uint32_t sem_actfree_id = get_compile_time_arg_val(23);
+    constexpr uint32_t sem_gather_ready_id = get_compile_time_arg_val(24);
 
-    constexpr auto routing_args = TensorAccessorArgs<14>();
+    constexpr auto routing_args = TensorAccessorArgs<25>();
     constexpr auto gate_up_args = TensorAccessorArgs<routing_args.next_compile_time_args_offset()>();
+    constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
 
     const uint32_t routing_addr = get_arg_val<uint32_t>(0);
     const uint32_t mcast_start_x = get_arg_val<uint32_t>(1);
@@ -71,7 +96,8 @@ void kernel_main() {
     const uint32_t mcast_end_y = get_arg_val<uint32_t>(4);
     const uint32_t num_dests = get_arg_val<uint32_t>(5);
     const uint32_t col_start_tile = get_arg_val<uint32_t>(6);
-    constexpr uint32_t kWeightAddrBase = 7;
+    constexpr uint32_t kGateUpAddrBase = 7;
+    constexpr uint32_t kDownAddrBase = kGateUpAddrBase + num_weights;
 
     // Pin the expert-id sender to NoC 0; the input broadcaster on {1,0} uses NoC 1.
     Noc noc(0);
@@ -125,16 +151,34 @@ void kernel_main() {
     Semaphore<>(sem_input_id).wait(1);
     publish_input(cb_input_id, k_tiles);
 
-    // ---- 5. Fetch this core's gate_up weight slice for the selected experts. ----
-    fetch_gate_up_slices(
+    // ---- 5. Per-expert reader loop (leader role): fetch weights + gather/broadcast act. ----
+    run_reader_loop<true>(
         noc,
+        num_active,
+        col_start_tile,
+        i_tiles,
+        k_tiles,
+        gate_up_tile_bytes,
+        down_slice_tiles,
+        down_tile_bytes,
+        act_tile_bytes,
+        num_producers,
+        num_cores,
         cb_bcast_id,
         cb_weights_id,
-        num_active,
-        k_tiles,
-        i_tiles,
-        tile_bytes,
-        col_start_tile,
+        cb_down_w_id,
+        cb_act_id,
+        sem_gather_id,
+        sem_bcast_id,
+        sem_actfree_id,
+        sem_gather_ready_id,
+        mcast_start_x,
+        mcast_start_y,
+        mcast_end_x,
+        mcast_end_y,
+        num_dests,
         gate_up_args,
-        kWeightAddrBase);
+        kGateUpAddrBase,
+        down_args,
+        kDownAddrBase);
 }
