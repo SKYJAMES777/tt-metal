@@ -8,6 +8,8 @@
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/eltwise_unary/clamp.h"
 #include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/bcast.h"
 #include "api/dataflow/circular_buffer.h"
 
 // Per-core gate_up matmul + SwiGLU gate + down matmul (runs on every compute core).
@@ -23,11 +25,15 @@
 //   slice of act[1, I]) is scattered by the writer to core {0,0}, gathered into the full
 //   activation, and broadcast back into every core's cb_act.
 //
-// PHASE 2 (all cores): the down matmul. cb_act holds the full activation act[1, I] (i_tiles
-//   tiles, K order). Each core multiplies it by its down weight shard ([I, H/64] ==
-//   [i_tiles, 2] tiles) to produce its 2-tile (64 column) slice of the output row[1, H]:
-//       cb_down_out = act @ down_w   (cb_down_w tile (k, n) at k*2 + n) -> [32, 64]
-//   summed over k == 0..i_tiles-1. cb_down_out feeds the writer (DRAM output [num_active, 1, H]).
+// PHASE 2 (all cores): the down matmul, scaled by each expert's routing weight and accumulated
+//   into a single output row. cb_act holds the full activation act[1, I] (i_tiles tiles, K
+//   order). For each expert, each core multiplies its down weight shard ([I, H/64] ==
+//   [i_tiles, 2] tiles) to produce its 2-tile (64 column) slice of down_e[1, H], scales it by
+//   the expert's routing weight via a SCALAR broadcast (cb_rscalar), and accumulates:
+//       down_e = act @ down_w   (cb_down_w tile (k, n) at k*2 + n) -> [32, 64]
+//       out   += routing_w[e] * down_e   (summed over all active experts)
+//   The running sum ping-pongs through cb_acc; the last expert writes cb_down_out, which the
+//   writer drains once into the [1, 1, H] DRAM output row.
 //
 // Compile-time args:
 //   0: num_active   (routing-selected experts to run)
@@ -35,12 +41,15 @@
 //   2: i_tiles      (I / 32; SwiGLU output cols AND down contraction (act K-tiles))
 //   3: cb_input     (activation tiles)
 //   4: cb_weights   (this core's per-expert [K, 128] gate+up slice)
-//   5: cb_mm        (gate_up matmul staging: 4 tiles = gate 0,1 | up 2,3)
+//   5: cb_mm        (gate_up matmul staging: 4 tiles = gate 0,1 | up 2,3; reused for down)
 //   6: cb_out       (this core's 2 SwiGLU output tiles per expert)
 //   7: limit_bits   (SwiGLU clamp limit as a float bit pattern)
 //   8: cb_act       (full gathered activation act[1, I], i_tiles tiles)
 //   9: cb_down_w    (this core's per-expert [I, 64] down slice = i_tiles*2 tiles)
-//  10: cb_down_out  (this core's 2 down output tiles per expert)
+//  10: cb_down_out  (this core's 2 accumulated output tiles, written once)
+//  11: cb_rscalar   (per-active-expert routing-weight scalar tiles for the SCALAR broadcast)
+//  12: cb_acc       (running weighted-sum accumulator, ping-ponged across experts)
+//  13: cb_wtmp      (staging for one expert's weighted down output before the accumulate)
 //
 // Runtime args:
 //   0: col_start_tile (this core's first SwiGLU output tile = compute_index * 2)
@@ -56,6 +65,9 @@ void kernel_main() {
     constexpr uint32_t cb_act_id = get_compile_time_arg_val(8);
     constexpr uint32_t cb_down_w_id = get_compile_time_arg_val(9);
     constexpr uint32_t cb_down_out_id = get_compile_time_arg_val(10);
+    constexpr uint32_t cb_rscalar_id = get_compile_time_arg_val(11);
+    constexpr uint32_t cb_acc_id = get_compile_time_arg_val(12);
+    constexpr uint32_t cb_wtmp_id = get_compile_time_arg_val(13);
 
     const uint32_t col_start_tile = get_arg_val<uint32_t>(0);
     const bool swiglu_core = col_start_tile < i_tiles;
@@ -77,6 +89,9 @@ void kernel_main() {
     CircularBuffer act_cb(cb_act_id);
     CircularBuffer down_w_cb(cb_down_w_id);
     CircularBuffer down_out_cb(cb_down_out_id);
+    CircularBuffer rscalar_cb(cb_rscalar_id);
+    CircularBuffer acc_cb(cb_acc_id);
+    CircularBuffer wtmp_cb(cb_wtmp_id);
 
     mm_init(cb_input_id, cb_weights_id, cb_mm_id);
 
@@ -171,21 +186,28 @@ void kernel_main() {
     }
 
     // ===================================================================================
-    // PHASE 2: down matmul for ALL experts (all cores). The single gather + broadcast has
-    // made the whole [num_active, I] activation block resident in cb_act; expert e's
-    // activation occupies tiles [e*i_tiles, (e+1)*i_tiles).
+    // PHASE 2: down matmul for ALL experts (all cores), each scaled by its routing weight and
+    // accumulated into a single output row. The single gather + broadcast has made the whole
+    // [num_active, I] activation block resident in cb_act; expert e's activation occupies tiles
+    // [e*i_tiles, (e+1)*i_tiles). For each expert:
+    //     down_e = act_e @ down_w_e                      -> cb_mm staging (2 tiles, fp32)
+    //     out   += routing_w[e] * down_e                 (SCALAR broadcast multiply + add)
+    // The running sum ping-pongs through cb_acc; the final expert writes cb_down_out, which the
+    // writer drains once into the [1, 1, H] DRAM output.
     // ===================================================================================
     const uint32_t act_total_tiles = num_active * i_tiles;
     act_cb.wait_front(act_total_tiles);
+    rscalar_cb.wait_front(num_active);
 
     for (uint32_t e = 0; e < num_active; ++e) {
         const uint32_t act_base = e * i_tiles;  // first activation tile for expert e
         down_w_cb.wait_front(down_slice_tiles);
 
+        // ---- down matmul -> cb_mm staging (reuses the dead Phase-1 gate_up staging buffer). ----
         mm_init_short(cb_act_id, cb_down_w_id);
         reconfig_data_format(cb_down_w_id, cb_act_id);
-        pack_reconfig_data_format(cb_down_out_id);
-        down_out_cb.reserve_back(kOutTilesPerCore);
+        pack_reconfig_data_format(cb_mm_id);
+        mm_cb.reserve_back(kOutTilesPerCore);
 
         tile_regs_acquire();
         for (uint32_t n = 0; n < kOutTilesPerCore; ++n) {
@@ -195,13 +217,63 @@ void kernel_main() {
         }
         tile_regs_commit();
         tile_regs_wait();
-        pack_tile(0, cb_down_out_id);
-        pack_tile(1, cb_down_out_id);
+        pack_tile(0, cb_mm_id);
+        pack_tile(1, cb_mm_id);
         tile_regs_release();
 
-        down_out_cb.push_back(kOutTilesPerCore);
+        mm_cb.push_back(kOutTilesPerCore);
         down_w_cb.pop_front(down_slice_tiles);
+
+        const bool last = (e == num_active - 1);
+
+        // ---- multiply: weighted_e = routing_w[e] * down_e (SCALAR broadcast). ----
+        // For the first expert there is nothing to accumulate yet, so the product goes straight
+        // to the running accumulator (or the final output if it is the only expert). Otherwise
+        // it is staged in cb_wtmp and added to the accumulator below.
+        const uint32_t mul_dst_id = (e == 0) ? (last ? cb_down_out_id : cb_acc_id) : cb_wtmp_id;
+        CircularBuffer mul_dst_cb(mul_dst_id);
+        mm_cb.wait_front(kOutTilesPerCore);
+        mul_tiles_bcast_scalar_init_short(cb_mm_id, cb_rscalar_id);
+        reconfig_data_format(cb_mm_id, cb_rscalar_id);
+        pack_reconfig_data_format(mul_dst_id);
+        mul_dst_cb.reserve_back(kOutTilesPerCore);
+
+        tile_regs_acquire();
+        mul_tiles_bcast_scalar(cb_mm_id, cb_rscalar_id, 0, e, 0);
+        mul_tiles_bcast_scalar(cb_mm_id, cb_rscalar_id, 1, e, 1);
+        tile_regs_commit();
+        mm_cb.pop_front(kOutTilesPerCore);
+        tile_regs_wait();
+        pack_tile(0, mul_dst_id);
+        pack_tile(1, mul_dst_id);
+        tile_regs_release();
+        mul_dst_cb.push_back(kOutTilesPerCore);
+
+        // ---- accumulate: out = acc + weighted_e (only once there is a prior partial sum). ----
+        if (e > 0) {
+            const uint32_t add_dst_id = last ? cb_down_out_id : cb_acc_id;
+            CircularBuffer add_dst_cb(add_dst_id);
+            acc_cb.wait_front(kOutTilesPerCore);
+            wtmp_cb.wait_front(kOutTilesPerCore);
+            add_tiles_init(cb_acc_id, cb_wtmp_id);
+            reconfig_data_format(cb_acc_id, cb_wtmp_id);
+            pack_reconfig_data_format(add_dst_id);
+            add_dst_cb.reserve_back(kOutTilesPerCore);
+
+            tile_regs_acquire();
+            add_tiles(cb_acc_id, cb_wtmp_id, 0, 0, 0);
+            add_tiles(cb_acc_id, cb_wtmp_id, 1, 1, 1);
+            tile_regs_commit();
+            acc_cb.pop_front(kOutTilesPerCore);
+            wtmp_cb.pop_front(kOutTilesPerCore);
+            tile_regs_wait();
+            pack_tile(0, add_dst_id);
+            pack_tile(1, add_dst_id);
+            tile_regs_release();
+            add_dst_cb.push_back(kOutTilesPerCore);
+        }
     }
 
+    rscalar_cb.pop_front(num_active);
     act_cb.pop_front(act_total_tiles);
 }

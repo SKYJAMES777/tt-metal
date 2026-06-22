@@ -61,8 +61,9 @@ void kernel_main() {
     constexpr uint32_t sem_gather_id = get_compile_time_arg_val(15);
     constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(16);
     constexpr uint32_t num_weights = get_compile_time_arg_val(17);
+    constexpr uint32_t cb_rscalar_id = get_compile_time_arg_val(18);
 
-    constexpr auto gate_up_args = TensorAccessorArgs<18>();
+    constexpr auto gate_up_args = TensorAccessorArgs<19>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
 
     const uint32_t col_start_tile = get_arg_val<uint32_t>(0);
@@ -101,5 +102,7 @@ void kernel_main() {
         gate_up_args,
         kGateUpAddrBase,
         down_args,
-        kDownAddrBase);
+        kDownAddrBase,
+        cb_rscalar_id,
+        num_weights);
 }

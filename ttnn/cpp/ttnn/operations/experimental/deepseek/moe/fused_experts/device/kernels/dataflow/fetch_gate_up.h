@@ -26,7 +26,8 @@
 //      address) and sets the broadcast semaphore. Now every core has the full activation.
 //   4. DOWN matmul: each of the 64 cores multiplies the full act[1, I] by its own down
 //      weight shard ([I, H/64] -> down_slice_tiles tiles) to produce its 2-tile (64-column)
-//      slice of the output row[1, H], written to the [num_active, 1, H] DRAM output.
+//      slice of the output row[1, H]; the compute kernel scales it by the expert's routing
+//      weight and accumulates across experts into the single [1, 1, H] DRAM output.
 //
 // cb_act is single-buffered, so experts are processed one at a time: the leader only
 // broadcasts expert e once every core has finished consuming expert e-1's activation
@@ -171,6 +172,38 @@ inline void receiver_recv_act_all(uint32_t cb_act_id, uint32_t act_total_tiles, 
     cb_act.push_back(act_total_tiles);
 }
 
+// Build one bf16 SCALAR-broadcast tile per active expert from the routing-weight scalars the
+// leader appended to cb_bcast (at index weight_base + e, as fp32 bit patterns). The down-output
+// multiply reads element [0,0] of the broadcast tile; following the canonical reduce/bcast
+// scaler layout, the value is splatted into the first row of all four 16x16 faces and the rest
+// zeroed. Runs once per core (the bcast buffer is resident before the reader loop starts).
+inline void build_routing_scalars(
+    uint32_t cb_bcast_id, uint32_t cb_rscalar_id, uint32_t num_active, uint32_t weight_base) {
+    CircularBuffer cb_bcast(cb_bcast_id);
+    CoreLocalMem<volatile uint32_t> bcast(cb_bcast.get_write_ptr());
+
+    CircularBuffer cb_rscalar(cb_rscalar_id);
+    cb_rscalar.reserve_back(num_active);
+    const uint32_t rscalar_l1 = cb_rscalar.get_write_ptr();
+
+    constexpr uint32_t kTileElems = 1024;            // 32x32 bf16 elements per tile
+    constexpr uint32_t kTileBytes = kTileElems * 2;  // bf16 tile = 2048 bytes
+    for (uint32_t e = 0; e < num_active; ++e) {
+        CoreLocalMem<volatile uint16_t> tile(rscalar_l1 + e * kTileBytes);
+        for (uint32_t j = 0; j < kTileElems; ++j) {
+            tile[j] = 0;
+        }
+        // fp32 bit pattern -> bf16 == high 16 bits.
+        const uint16_t w_bf16 = static_cast<uint16_t>(bcast[weight_base + e] >> 16);
+        for (uint32_t k = 0; k < 4; ++k) {       // 4 faces
+            for (uint32_t j = 0; j < 16; ++j) {  // first row of each face
+                tile[k * 256 + j] = w_bf16;
+            }
+        }
+    }
+    cb_rscalar.push_back(num_active);
+}
+
 // Per-core reader loop shared by all DM reader kernels, structured in two phases around a
 // single synchronization:
 //   Phase 1: fetch this core's gate_up slice for ALL experts (SwiGLU cores only). The compute
@@ -206,9 +239,15 @@ inline void run_reader_loop(
     const GateUpArgs& gate_up_args,
     uint32_t rt_gu_addr_base,
     const DownArgs& down_args,
-    uint32_t rt_down_addr_base) {
+    uint32_t rt_down_addr_base,
+    uint32_t cb_rscalar_id,
+    uint32_t weight_base) {
     const bool swiglu_core = col_start_tile < i_tiles;
     const uint32_t shard_id = col_start_tile / kOutTilesPerCore;
+
+    // Build this core's routing-weight scalar tiles (one per active expert) for the down-output
+    // weighted accumulation. The bcast buffer (ids + scalars) is already resident on every core.
+    build_routing_scalars(cb_bcast_id, cb_rscalar_id, num_active, weight_base);
 
     // ---- Phase 1: gate_up weights for all experts (throttled by cb_weights double-buffer). ----
     if (swiglu_core) {

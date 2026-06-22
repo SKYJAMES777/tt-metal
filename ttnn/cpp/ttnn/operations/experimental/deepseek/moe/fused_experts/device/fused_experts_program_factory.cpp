@@ -49,8 +49,9 @@ uint32_t align_up_32(uint32_t x) { return (x + 31u) & ~31u; }
 //     back-pressure is needed.
 //   - PHASE 2 -- DOWN matmul for ALL experts: each of the 64 cores fetches its [I, H/64]
 //     down shard per expert (one NoC read) and multiplies it by that expert's activation to
-//     produce its 2-tile slice of the output row[1, H], which the writer writes to the
-//     [num_active, 1, H] DRAM output (one row per selected expert).
+//     produce its 2-tile slice of the output row[1, H]. The compute kernel scales each
+//     expert's slice by its routing weight (SCALAR broadcast) and accumulates across all
+//     experts, so the writer writes a single [1, 1, H] DRAM output row (the weighted sum).
 ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const operation_attributes_t& operation_attributes,
     const tensor_args_t& tensor_args,
@@ -111,7 +112,6 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     // reused (the fetch indexes by shard id == this core's index).
     const auto& down0 = tensor_args.down_weights.front();
     auto* down0_buffer = down0.buffer();
-    const uint32_t down_n_tiles = static_cast<uint32_t>(down0.logical_shape()[-1]) / TILE_DIM;  // H / 32
     const uint32_t down_slice_tiles = i_tiles * kTilesPerCore;  // [I, 64] = i_tiles * 2 tiles
     const uint32_t down_tile_bytes = static_cast<uint32_t>(down0_buffer->page_size());
     const uint32_t down_cb_bytes = 2u * down_slice_tiles * down_tile_bytes;  // double-buffered
@@ -129,17 +129,18 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     constexpr uint32_t out_elem_bytes = 4;      // uint32 expert ids (broadcast scratch)
     // Routing row and the id broadcast span all provided experts.
     const uint32_t routing_page_bytes = num_weights * routing_elem_bytes;
-    const uint32_t bcast_page_bytes = num_weights * out_elem_bytes;
+    // cb_bcast carries the compacted expert ids (num_weights uint32, ascending hit ids padded
+    // with the sentinel) followed by the active experts' routing-weight scalars (num_active
+    // fp32 bit patterns, in the same hit order), broadcast to every core in one multicast.
+    const uint32_t bcast_page_bytes = (num_weights + num_active) * out_elem_bytes;
 
     // Activation is TILE layout [1,1,1,H] -> Kt == k_tiles tiles (one tile-row).
     const uint32_t input_page_size = static_cast<uint32_t>(input_buffer->page_size());
     const uint32_t input_num_pages = static_cast<uint32_t>(input_buffer->num_pages());
 
-    // Output is TILE [num_active, 1, H] bf16 (the down matmul result): each core writes its
-    // 2 output tiles (its 64-column H slice) per expert. h_tiles == H/32 is the output page
-    // stride per expert row.
+    // Output is TILE [1, 1, H] bf16 (the routing-weighted sum of every active expert's down
+    // matmul): each core writes its 2 output tiles (its 64-column H slice) of the single row.
     const uint32_t out_tile_bytes = static_cast<uint32_t>(out_buffer->page_size());
-    const uint32_t h_tiles = down_n_tiles;  // H / 32
 
     // The gathered activation is stored as Bfp8_b (not bf16) to keep the resident
     // [num_active, I] block -- the dominant L1 consumer -- within the L1 budget. The SwiGLU
@@ -175,8 +176,21 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     // EVERY core (e.g. num_active=6, I=2048 -> 6*64*2KB = 768 KB) -- so large num_active / I
     // can exceed the L1 budget.
     const uint32_t act_cb_bytes = num_active * i_tiles * act_tile_bytes;
-    // Per-core down output (kOutTilesPerCore tiles per expert), double-buffered.
+    // Per-core down output: the single accumulated [1, H] output row slice (kOutTilesPerCore
+    // tiles), double-buffered.
     const uint32_t down_out_cb_bytes = 2u * kOutTilesPerCore * out_tile_bytes;
+    // Routing-weight scalar tiles (one per active expert) for the bf16 SCALAR broadcast that
+    // scales each expert's down output before accumulation. Built per core by the reader.
+    const tt::DataFormat scalar_df = tt::DataFormat::Float16_b;
+    const uint32_t scalar_tile_bytes = tt::tile_size(scalar_df);
+    const uint32_t rscalar_cb_bytes = num_active * scalar_tile_bytes;
+    // Per-core running accumulator for the weighted down-output sum (kOutTilesPerCore tiles),
+    // double-buffered so the compute kernel can ping-pong the partial sum across experts.
+    const uint32_t acc_cb_bytes = 2u * kOutTilesPerCore * out_tile_bytes;
+    // Per-core staging for one expert's weighted down output (kOutTilesPerCore tiles),
+    // double-buffered. Holds routing_w[e] * down_e between the SCALAR-broadcast multiply and the
+    // add into the accumulator (kept separate so each compute block uses a single op type).
+    const uint32_t wtmp_cb_bytes = 2u * kOutTilesPerCore * out_tile_bytes;
 
     // CB reuse: the single gather/broadcast sync is a hard barrier between Phase 1 (gate_up) and
     // Phase 2 (down), so Phase-1-only buffers are dead during Phase 2 and can host Phase-2-only
@@ -364,6 +378,43 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         }}},
     });
 
+    // Routing-weight scalar tiles (one per active expert, bf16) consumed by the down-output
+    // SCALAR broadcast multiply. The reader splats each expert's scalar into [0,0] of its tile.
+    constexpr uint32_t cb_rscalar = CBIndex::c_7;
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = rscalar_cb_bytes,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_rscalar,
+            .data_format = scalar_df,
+            .page_size = scalar_tile_bytes,
+        }}},
+    });
+
+    // Running accumulator for the weighted down-output sum (compute-internal ping-pong).
+    constexpr uint32_t cb_acc = CBIndex::c_9;
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = acc_cb_bytes,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_acc,
+            .data_format = out_df,
+            .page_size = out_tile_bytes,
+        }}},
+    });
+
+    // Staging for one expert's weighted down output (compute-internal).
+    constexpr uint32_t cb_wtmp = CBIndex::c_10;
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = wtmp_cb_bytes,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_wtmp,
+            .data_format = out_df,
+            .page_size = out_tile_bytes,
+        }}},
+    });
+
     // Multicast rectangle (NoC coords) covering the whole grid. Non-loopback
     // multicast excludes the sender, so num_dests = total cores - 1.
     const auto corner_a = device->worker_core_from_logical_core(CoreCoord{0, 0});
@@ -411,7 +462,7 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         num_weights,      num_active,    sentinel,        cb_routing,   cb_bcast,         routing_page_bytes,
         bcast_page_bytes, sem_id,        cb_weights,      k_tiles,      i_tiles,          weight_tile_bytes,
         sem_input_id,     cb_input,      cb_down_weights, cb_act,       down_slice_tiles, down_tile_bytes,
-        act_tile_bytes,   num_producers, sem_gather_id,   sem_bcast_id,
+        act_tile_bytes,   num_producers, sem_gather_id,   sem_bcast_id, cb_rscalar,
     };
     TensorAccessorArgs(*routing_buffer).append_to(sender_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(sender_ct_args);
@@ -443,10 +494,10 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
 
     // ---- Input-broadcaster kernel on {1,0} (NoC 1). ----
     std::vector<uint32_t> input_ct_args = {
-        cb_input,       input_page_size, input_num_pages, sem_input_id,     sem_id,
-        num_active,     cb_weights,      k_tiles,         i_tiles,          weight_tile_bytes,
-        cb_bcast,       cb_down_weights, cb_act,          down_slice_tiles, down_tile_bytes,
-        act_tile_bytes, num_producers,   sem_gather_id,   sem_bcast_id,     num_weights,
+        cb_input,     input_page_size,  input_num_pages, sem_input_id,      sem_id,        num_active,
+        cb_weights,   k_tiles,          i_tiles,         weight_tile_bytes, cb_bcast,      cb_down_weights,
+        cb_act,       down_slice_tiles, down_tile_bytes, act_tile_bytes,    num_producers, sem_gather_id,
+        sem_bcast_id, num_weights,      cb_rscalar,
     };
     TensorAccessorArgs(*input_buffer).append_to(input_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(input_ct_args);
@@ -479,24 +530,10 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
 
     // ---- Receiver reader kernel on the other 62 cores (NoC 0). ----
     std::vector<uint32_t> receiver_ct_args = {
-        sem_id,
-        sem_input_id,
-        num_active,
-        cb_input,
-        cb_weights,
-        k_tiles,
-        i_tiles,
-        weight_tile_bytes,
-        cb_bcast,
-        cb_down_weights,
-        cb_act,
-        down_slice_tiles,
-        down_tile_bytes,
-        act_tile_bytes,
-        num_producers,
-        sem_gather_id,
-        sem_bcast_id,
-        num_weights,
+        sem_id,        sem_input_id,     num_active,        cb_input,       cb_weights,
+        k_tiles,       i_tiles,          weight_tile_bytes, cb_bcast,       cb_down_weights,
+        cb_act,        down_slice_tiles, down_tile_bytes,   act_tile_bytes, num_producers,
+        sem_gather_id, sem_bcast_id,     num_weights,       cb_rscalar,
     };
     TensorAccessorArgs(*gate_up0_buffer).append_to(receiver_ct_args);
     TensorAccessorArgs(*down0_buffer).append_to(receiver_ct_args);
@@ -532,6 +569,9 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         cb_act,
         cb_down_weights,
         cb_down_out,
+        cb_rscalar,
+        cb_acc,
+        cb_wtmp,
     };
     KernelDescriptor compute_desc;
     compute_desc.kernel_source = std::string(kKernelDir) + "/compute/matmul_gate_up.cpp";
@@ -554,7 +594,6 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     std::vector<uint32_t> writer_ct_args = {
         num_active,
         i_tiles,  // I/32: SwiGLU-core guard for the gather scatter
-        h_tiles,  // H/32: output page stride per expert row
         cb_out,
         cb_down_out,
         cb_act,

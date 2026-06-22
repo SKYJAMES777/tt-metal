@@ -2,15 +2,16 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit test for ttnn.experimental.deepseek.moe.fused_experts (gate_up + SwiGLU + down milestone).
+"""Unit test for ttnn.experimental.deepseek.moe.fused_experts (full preloaded-experts FFN).
 
 The op takes *all* experts' weights and uses the routing weights to select which
 experts to run. For the routing-selected ("hit") experts, in ascending hit-id order,
-it computes the gate_up matmul, the SwiGLU gate, *and* the down matmul on device:
+it computes the gate_up matmul, the SwiGLU gate, the down matmul, *and* the
+routing-weighted accumulation into a single output row on device:
 
-    gu        = x @ gate_up_w[hit_ids[i]]                          # [1, H] @ [H, 2I] -> [1, 2I]
-    act       = silu(clamp(gu[:I], max=L)) * clamp(gu[I:], -L, L)  # -> [1, I]
-    output[i] = act @ down_w[hit_ids[i]]                           # [1, I] @ [I, H] -> [1, H]
+    gu     = x @ gate_up_w[hit_ids[i]]                          # [1, H] @ [H, 2I] -> [1, 2I]
+    act    = silu(clamp(gu[:I], max=L)) * clamp(gu[I:], -L, L)  # -> [1, I]
+    output = sum_i routing_weights[hit_ids[i]] * (act @ down_w[hit_ids[i]])  # -> [1, H]
 
 The I SwiGLU columns are distributed across the compute grid: each SwiGLU core owns a
 2-tile (64-column) slice and needs both the gate columns [64c, 64c+64) and the paired up
@@ -18,9 +19,9 @@ columns [I+64c, I+64c+64) of the gate_up weight, kept in a *single* [H, 128] DRA
 (host-permuted into per-core [gate_64 | up_64] blocks). The down matmul contracts over the
 full I, so each SwiGLU core scatters its activation slice to core {0,0}, which gathers the
 full activation and broadcasts it to every core; each core then multiplies it by its
-[I, H/64] down shard to produce its 64-column slice of the [1, H] output row. The output
-tensor is [num_active, 1, H] in TILE layout (the decode token row padded to a 32-row tile),
-BFLOAT16.
+[I, H/64] down shard to produce its 64-column slice of each expert's [1, H] row, scales it
+by the expert's routing weight (SCALAR broadcast) and accumulates across experts. The output
+tensor is [1, 1, H] in TILE layout (the decode token row padded to a 32-row tile), BFLOAT16.
 
 Decode-only: sequence length T == 1.
 """
@@ -130,6 +131,13 @@ def test_fused_experts_gate_up(device, hidden, intermediate, num_experts, num_no
     )
 
     x_tt = to_tt(x_flat, ttnn.TILE_LAYOUT)
+    routing_tt = ttnn.from_torch(
+        routing_4d,
+        dtype=ttnn.bfloat16,
+        device=device,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
     gate_up_tt = [
         to_tt(w, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat4_b, memory_config=gate_up_mem_config) for w in gate_up_perm
     ]
@@ -137,13 +145,7 @@ def test_fused_experts_gate_up(device, hidden, intermediate, num_experts, num_no
 
     tt_out = ttnn.experimental.deepseek.moe.fused_experts(
         x_tt,
-        routing_weights=ttnn.from_torch(
-            routing_4d,
-            dtype=ttnn.bfloat16,
-            device=device,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        ),
+        routing_weights=routing_tt,
         gate_up_weights=gate_up_tt,
         down_weights=down_tt,
         num_experts=num_nonzero,
@@ -151,23 +153,21 @@ def test_fused_experts_gate_up(device, hidden, intermediate, num_experts, num_no
         swiglu_limit=limit,
     )
 
-    out_torch = ttnn.to_torch(tt_out).float()  # [num_active, 1, H]
-    assert list(out_torch.shape) == [num_nonzero, 1, hidden], f"unexpected output shape {out_torch.shape}"
+    out_torch = ttnn.to_torch(tt_out).float()  # [1, 1, H]
+    assert list(out_torch.shape) == [1, 1, hidden], f"unexpected output shape {out_torch.shape}"
 
-    # Only the routing-selected experts are computed; output row i == hit_ids[i].
-    # Reference from the original (full-precision) torch weights; the device path adds
-    # bf16 input rounding and bf4 weight quantization, so PCC (not exact match) is checked.
+    # The op returns the routing-weighted sum over the selected experts:
+    #   out = sum_i routing_weights[hit_ids[i]] * (swiglu(x @ gate_up_w) @ down_w).
+    # Reference uses the bf16-rounded input and routing weights to match the device path; the
+    # chained bf4 matmuls add quantization error, so PCC (not exact match) is checked.
     x_dev = ttnn.to_torch(x_tt).float().reshape(tokens, hidden)
-    failures = []
-    for i, e in enumerate(hit_ids):
+    rw_dev = ttnn.to_torch(routing_tt).float().reshape(num_experts)
+    ref = torch.zeros((tokens, hidden), dtype=torch.float32)
+    for e in hit_ids:
         gu = (x_dev @ gate_up_weights[e]).reshape(tokens, two_intermediate)  # [1, 2I]
         act = _swiglu(gu, intermediate, limit)  # [1, I]
-        ref_e = act @ down_weights[e]  # [1, I] @ [I, H] -> [1, H]
-        got_e = out_torch[i, :tokens, :]
-        # Two chained bfloat4_b matmuls (gate_up then down) compound the weight
-        # quantization error, so the PCC bar is slightly below the gate_up-only milestone.
-        passing, pcc_msg = comp_pcc(ref_e, got_e, pcc=0.98)
-        if not passing:
-            failures.append(f"row {i} (expert {e}): {pcc_msg} | {comp_allclose(ref_e, got_e)}")
+        ref = ref + rw_dev[e] * (act @ down_weights[e])  # [1, H], weighted-accumulated
 
-    assert not failures, "gate_up + SwiGLU + down output mismatch:\n" + "\n".join(failures)
+    got = out_torch.reshape(tokens, hidden)
+    passing, pcc_msg = comp_pcc(ref, got, pcc=0.98)
+    assert passing, f"weighted-sum output mismatch: {pcc_msg} | {comp_allclose(ref, got)}"

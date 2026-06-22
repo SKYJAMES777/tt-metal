@@ -165,16 +165,14 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_hit(
 
 FusedExpertsDeviceOperation::spec_return_value_t FusedExpertsDeviceOperation::compute_output_specs(
     const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
-    // The output holds the down matmul result for the routing-selected experts in ascending
-    // hit-id order:
-    //   act       = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit),
-    //               where [gate, up] = x @ gate_up_w[hit_ids[i]];
-    //   output[i] = act @ down_w[hit_ids[i]].
-    // Shape [num_experts, 1, H] (decode token row, padded to a 32-row tile in TILE layout),
-    // BFLOAT16. H is the hidden size (== down weight output dim == input hidden dim).
-    const uint32_t num_experts = attributes.num_experts;
+    // The output is the routing-weighted sum of every selected expert's down matmul result:
+    //   act    = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit),
+    //            where [gate, up] = x @ gate_up_w[hit_ids[i]];
+    //   output = sum_i routing_weights[hit_ids[i]] * (act @ down_w[hit_ids[i]]).
+    // Shape [1, 1, H] (decode token row, padded to a 32-row tile in TILE layout), BFLOAT16.
+    // H is the hidden size (== down weight output dim == input hidden dim).
     const uint32_t hidden = static_cast<uint32_t>(tensor_args.input_tensor.logical_shape()[-1]);
-    const ttnn::Shape output_shape({num_experts, 1, hidden});
+    const ttnn::Shape output_shape({1, 1, hidden});
     return TensorSpec(
         output_shape,
         tt::tt_metal::TensorLayout(

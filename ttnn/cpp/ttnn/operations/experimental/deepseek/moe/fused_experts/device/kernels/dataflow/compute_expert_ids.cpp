@@ -78,8 +78,9 @@ void kernel_main() {
     constexpr uint32_t num_producers = get_compile_time_arg_val(19);
     constexpr uint32_t sem_gather_id = get_compile_time_arg_val(20);
     constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(21);
+    constexpr uint32_t cb_rscalar_id = get_compile_time_arg_val(22);
 
-    constexpr auto routing_args = TensorAccessorArgs<22>();
+    constexpr auto routing_args = TensorAccessorArgs<23>();
     constexpr auto gate_up_args = TensorAccessorArgs<routing_args.next_compile_time_args_offset()>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
 
@@ -111,10 +112,15 @@ void kernel_main() {
     CoreLocalMem<volatile uint16_t> rw(cb_routing.get_write_ptr());
     CoreLocalMem<volatile uint32_t> ids(bcast_l1);
 
+    // ids[0..num_weights)        : compacted ascending hit ids, padded with the sentinel.
+    // ids[num_weights..+num_active): each hit's routing-weight scalar as an fp32 bit pattern
+    //   (bf16 value << 16), in the same hit order, for the down-output scalar broadcast.
     uint32_t n = 0;
     for (uint32_t e = 0; e < num_weights; ++e) {
         if ((rw[e] & 0x7FFF) != 0) {
-            ids[n++] = e;
+            ids[n] = e;
+            ids[num_weights + n] = static_cast<uint32_t>(rw[e]) << 16;
+            ++n;
         }
     }
     for (uint32_t i = n; i < num_weights; ++i) {
@@ -171,5 +177,7 @@ void kernel_main() {
         gate_up_args,
         kGateUpAddrBase,
         down_args,
-        kDownAddrBase);
+        kDownAddrBase,
+        cb_rscalar_id,
+        num_weights);
 }
