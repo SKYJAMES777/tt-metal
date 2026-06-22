@@ -358,7 +358,7 @@ jobs:
     needs: [resolve-docker-pull-refs, resolve-artifacts, generate-matrix, check-harbor]
     if: ${{ always() && !cancelled() && (inputs.run-ttnn-unit-tests == true || (github.event_name == 'schedule' && needs.resolve-artifacts.outputs.schedule-runs-all-tests-effective == 'true')) }}
     secrets: inherit
-    uses: ./.github/workflows/ttnn-post-commit.yaml
+    uses: ./.github/workflows/ttnn-sanity-tests-impl.yaml
     strategy:
       fail-fast: false
       matrix:
