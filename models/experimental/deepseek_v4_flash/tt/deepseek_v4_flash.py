@@ -1094,39 +1094,96 @@ class DeepSeekV4HashRouter(DeepSeekV4Module):
         return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
 
 
-def _swiglu_gate(gate_up: ttnn.Tensor, intermediate: int, limit: float) -> ttnn.Tensor:
-    """Clamp + SiLU-GLU on a packed ``[..., 2I]`` gate_up output (matches
-    ``DeepseekV4Experts._apply_gate``): ``silu(clamp(gate)) * clamp(up)``.
+# --------------------------------------------------------------------------- #
+# fused_experts (single-op decode path)
+#
+# ``ttnn.experimental.deepseek.moe.fused_experts`` runs the whole routed-expert
+# FFN (gate_up + SwiGLU + down + routing-weighted accumulation) for one token in
+# a single device op. It is hard-wired to the real V4-Flash sizes -- an 8x8 (64)
+# compute grid where each core owns 2 output tiles, so the hidden size must be
+# exactly ``_FUSED_HIDDEN`` (64 * 2 * 32) -- and is decode-only (``T == 1``). The
+# weights must be DRAM ND-sharded with one shard per core (see below), a layout
+# distinct from the plain matmul weights used by the prefill loop, so the decode
+# path keeps its own copy.
+# --------------------------------------------------------------------------- #
+_FUSED_HIDDEN = 4096  # op requires H == 64 cores * 2 tiles * 32 = 4096
+_FUSED_COLS_PER_CORE = 64  # SwiGLU output columns per core (2 tiles)
+_FUSED_NUM_CORES = 64  # 8x8 compute grid
+_FUSED_DRAM_BANKS = 8  # Blackhole DRAM banks (round-robin shard target)
 
-    Slices (rather than ``ttnn.split``) into the gate / up halves — the
-    ``split_two_chunks`` kernel miscompiles for this layout on blackhole.
+
+def _interleave_gate_up(w: torch.Tensor, block: int = _FUSED_COLS_PER_CORE) -> torch.Tensor:
+    """Permute a ``[K, 2I]`` gate_up weight into per-core ``[gate_block | up_block]``
+    order so each ``[K, 2*block]`` DRAM shard holds a core's gate columns followed
+    by its paired up columns (what ``fused_experts`` reads in a single NoC read).
+
+    ``gate = w[:, :I]``, ``up = w[:, I:]``; output column ``c*2*block + h*block + t``
+    maps to ``w[:, h*I + c*block + t]``.
     """
-    shape = list(gate_up.shape)
-    end = list(shape)
-    end[-1] = intermediate
-    start = [0] * len(shape)
-    gate = ttnn.slice(gate_up, start, end)
-    start_up = [0] * len(shape)
-    start_up[-1] = intermediate
-    up = ttnn.slice(gate_up, start_up, shape)
-    gate = ttnn.clamp(gate, min=None, max=limit)
-    up = ttnn.clamp(up, min=-limit, max=limit)
-    return ttnn.multiply(ttnn.silu(gate), up)
+    k, two_i = w.shape
+    intermediate = two_i // 2
+    blocks = intermediate // block
+    return w.reshape(k, 2, blocks, block).permute(0, 2, 1, 3).reshape(k, two_i).contiguous()
+
+
+def _fused_nd_dram_config(rows: int, cols: int, shard_width: int) -> ttnn.MemoryConfig:
+    """DRAM ND-shard config: ``rows x shard_width`` shards round-robined over the
+    DRAM banks (one shard per compute core), as ``fused_experts`` expects."""
+    assert cols % shard_width == 0, f"last dim {cols} must divide into shards of {shard_width}"
+    dram_core_range_set = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(bank, 0), ttnn.CoreCoord(bank, 0)) for bank in range(_FUSED_DRAM_BANKS)]
+    )
+    return ttnn.MemoryConfig(
+        ttnn.BufferType.DRAM,
+        ttnn.NdShardSpec(
+            shard_shape=[rows, shard_width],
+            grid=dram_core_range_set,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            shard_distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
+        ),
+    )
+
+
+def _load_fused_weight(
+    tensor: Optional[torch.Tensor],
+    device: ttnn.MeshDevice,
+    nd_config: ttnn.MemoryConfig,
+    *,
+    cache_file_name: Optional[str] = None,
+    dtype: ttnn.DataType = ttnn.bfloat4_b,
+) -> ttnn.Tensor:
+    """Load a ``fused_experts`` weight as a DRAM ND-sharded tensor.
+
+    The tile cache cannot round-trip an ND-shard memory config (a cache *hit*
+    reloads the tensor with its plain serialized spec), so the (interleaved)
+    weight is cached in standard interleaved DRAM under its own cache entry and
+    then resharded to the ND-shard layout on device.
+    """
+    standard = _load_weight(tensor, device, cache_file_name=cache_file_name, dtype=dtype)
+    sharded = ttnn.to_memory_config(standard, nd_config)
+    ttnn.deallocate(standard)
+    return sharded
 
 
 class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
-    """Routed-experts compute with all expert weights resident on device.
+    """Routed-experts compute via the single-op ``fused_experts`` kernel.
 
-    The dense :class:`DeepSeekV4Experts` stacks every expert's weights in a
-    single batched parameter — fine for the reduced test config, but the real
-    V4-Flash layer has 256 experts of ``[2*2048, 4096]`` / ``[4096, 2048]``
-    (~13 GB in bf16). This variant keeps every expert on device but stored as
-    ``BFloat4_b`` (4-bit block-float), which fits comfortably (~3.5 GB) and is a
-    natural match for these weights since the checkpoint already ships the routed
-    experts in 4-bit (MXFP4). At init it pulls each expert's dequantized weights
-    from the host ``provider`` once and uploads the transposed matmul-ready
+    The whole routed-expert FFN for one token (gate_up + SwiGLU + down +
+    routing-weighted accumulation) runs in a single ``fused_experts`` device op.
+    The op is hard-wired to the real V4-Flash sizes -- an 8x8 (64) compute grid
+    where each core owns 2 output tiles, so ``H`` must be exactly ``_FUSED_HIDDEN``
+    (``64 * 2 * 32 == 4096``) and ``I`` a multiple of the 64-column per-core
+    slice. Both prefill and decode go through the op: it is natively single-token
+    (``T == 1``), so **prefill is computed by decode** -- each of the ``T`` tokens
+    runs as its own op and the per-token outputs are concatenated.
+
+    Every expert is kept resident on device as DRAM ND-sharded weights (one shard
+    per compute core), in low precision (``BFloat4_b`` by default; ~3.5 GB for the
+    256 experts, a natural match for the MXFP4 checkpoint). At init it pulls each
+    expert's dequantized weights from the host ``provider`` once, permutes the
+    gate_up into the op's interleaved per-core layout, and uploads the ND-sharded
     tensors; ``forward`` then runs purely on device with no per-step host
-    transfers.
+    transfers beyond reading the (tiny) routing weights to pick the hit experts.
 
     ``provider(expert_idx) -> (gate_up [2I, H], down [H, I])`` returns host
     torch tensors (the HF packed layout: ``gate_up`` is ``cat([w_gate, w_up])``).
@@ -1149,61 +1206,93 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         self.limit = config.swiglu_limit
         cache = _as_cache(cache)
 
-        # Upload every expert once, transposed to matmul-ready [H, 2I] / [I, H]
-        # and stored in low precision on device. With caching enabled and a hit,
-        # the provider (and its expensive dequant) is skipped entirely.
-        self._gate_up: list[ttnn.Tensor] = []
-        self._down: list[ttnn.Tensor] = []
+        # ``fused_experts`` is hard-wired to the real V4-Flash sizes: ``H == 4096``
+        # on the 64-core grid and ``I`` a multiple of the 64-column per-core slice.
+        # There is no fallback path -- this class is for that config only.
+        if self.hidden != _FUSED_HIDDEN or self.intermediate % _FUSED_COLS_PER_CORE != 0:
+            raise ValueError(
+                f"DeepSeekV4PreloadedExperts requires the fused_experts layout "
+                f"(H == {_FUSED_HIDDEN}, I % {_FUSED_COLS_PER_CORE} == 0); "
+                f"got H={self.hidden}, I={self.intermediate}"
+            )
+        gate_up_nd = _fused_nd_dram_config(self.hidden, 2 * self.intermediate, 2 * _FUSED_COLS_PER_CORE)
+        down_nd = _fused_nd_dram_config(self.intermediate, self.hidden, self.hidden // _FUSED_NUM_CORES)
+
+        # Upload every expert once as the op's DRAM ND-sharded weights (gate_up
+        # interleaved per core, down ND-sharded), stored in low precision. With
+        # caching enabled and a hit, the provider (and its expensive dequant) is
+        # skipped entirely; the ND-shard layout can't round-trip the tile cache,
+        # so the interleaved weight is cached in standard DRAM and resharded on
+        # device (see :func:`_load_fused_weight`).
+        self._gate_up_fused: list[ttnn.Tensor] = []
+        self._down_fused: list[ttnn.Tensor] = []
         for e in range(self.num_experts):
-            gu_name, dn_name = f"experts.{e}.gate_up", f"experts.{e}.down"
-            need_torch = not (cache.hit(gu_name, dtype) and cache.hit(dn_name, dtype))
+            gu_f_name, dn_f_name = f"experts.{e}.gate_up_fused", f"experts.{e}.down_fused"
+            need_torch = not (cache.hit(gu_f_name, dtype) and cache.hit(dn_f_name, dtype))
             if cache.require_cache and need_torch:
                 raise RuntimeError(f"weight cache miss for routed expert {e} (gate_up/down) with require_cache=True")
             gate_up_w, down_w = provider(e) if need_torch else (None, None)
-            self._gate_up.append(
-                _load_weight(
-                    gate_up_w.t().contiguous() if gate_up_w is not None else None,
-                    device,
-                    cache_file_name=cache.file(gu_name),
-                    dtype=dtype,
-                )
+            # Provider gives gate_up [2I, H] / down [H, I]; transpose to matmul-ready
+            # [H, 2I] / [I, H] (memoized so each is materialized at most once).
+            gate_up_t = _memo((lambda gw=gate_up_w: gw.t().contiguous()) if gate_up_w is not None else (lambda: None))
+            down_t = _memo((lambda dw=down_w: dw.t().contiguous()) if down_w is not None else (lambda: None))
+            gu_il = _materialize(lambda: _interleave_gate_up(gate_up_t()), cache.file(gu_f_name), dtype)
+            self._gate_up_fused.append(
+                _load_fused_weight(gu_il, device, gate_up_nd, cache_file_name=cache.file(gu_f_name), dtype=dtype)
             )
-            self._down.append(
-                _load_weight(
-                    down_w.t().contiguous() if down_w is not None else None,
-                    device,
-                    cache_file_name=cache.file(dn_name),
-                    dtype=dtype,
-                )
+            self._down_fused.append(
+                _load_fused_weight(down_t(), device, down_nd, cache_file_name=cache.file(dn_f_name), dtype=dtype)
             )
+
+    def _decode_token(self, x_tok: ttnn.Tensor, rw_tok: torch.Tensor) -> ttnn.Tensor:
+        """Run one token's routed FFN through ``fused_experts``.
+
+        ``x_tok`` ``[1,1,1,H]`` and ``rw_tok`` the host routing-weight row ``[E]``;
+        returns ``[1,1,1,H]``. The op finds the active (non-zero) experts from the
+        routing row itself, so we only pass ``num_experts`` = the hit count.
+        """
+        hit = (rw_tok.abs() > 0).nonzero().flatten().tolist()
+        if not hit:  # no expert selected (degenerate) -> zeros
+            return ttnn.multiply(x_tok, 0.0)
+        routing_row = ttnn.from_torch(
+            rw_tok.reshape(1, 1, 1, self.num_experts),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+        out = ttnn.experimental.deepseek.moe.fused_experts(
+            x_tok,
+            routing_weights=routing_row,
+            gate_up_weights=self._gate_up_fused,
+            down_weights=self._down_fused,
+            num_experts=len(hit),
+            intermediate_size=self.intermediate,
+            swiglu_limit=self.limit,
+        )  # [1, 1, H]
+        ttnn.ReadDeviceProfiler(self.device)
+        return ttnn.reshape(out, [1, 1, 1, self.hidden])
 
     def forward(self, x_flat: ttnn.Tensor, routing_weights: ttnn.Tensor) -> ttnn.Tensor:
-        """``x_flat`` ``[1,1,T,H]`` and ``routing_weights`` ``[1,1,T,E]``; returns ``[1,1,T,H]``."""
+        """``x_flat`` ``[1,1,T,H]`` and ``routing_weights`` ``[1,1,T,E]``; returns ``[1,1,T,H]``.
+
+        Every token runs as its own single-token ``fused_experts`` op (the op is
+        natively ``T == 1``), so prefill is computed by decode: the ``T`` per-token
+        outputs are concatenated back into ``[1,1,T,H]``.
+        """
         t = x_flat.shape[2]
-        # Read the (small) routing weights to host once to find which experts
-        # were actually selected — skip the rest instead of looping all 256.
+        # Read the (small) routing weights to host once: each token's op picks its
+        # own hit experts from its row, so no device-side gather is needed here.
         rw_host = ttnn.to_torch(routing_weights).reshape(t, self.num_experts).float()
-        hit = (rw_host.abs().sum(dim=0) > 0).nonzero().flatten().tolist()
         ttnn.ReadDeviceProfiler(self.device)
 
-        acc = None
-        for e in hit:
-            gate_up = ttnn.matmul(x_flat, self._gate_up[e], compute_kernel_config=_HIFI4)  # [1,1,T,2I]
-            act = _swiglu_gate(gate_up, self.intermediate, self.limit)  # [1,1,T,I]
-            down = ttnn.matmul(act, self._down[e], compute_kernel_config=_HIFI4)  # [1,1,T,H]
+        if t == 1:
+            return self._decode_token(x_flat, rw_host[0])
 
-            w_e = ttnn.slice(routing_weights, [0, 0, 0, e], [1, 1, t, e + 1])  # [1,1,T,1]
-            weighted = ttnn.multiply(down, w_e)
-            acc = weighted if acc is None else ttnn.add(acc, weighted)
-
-            ttnn.deallocate(gate_up)
-            ttnn.deallocate(act)
-            ttnn.deallocate(down)
-            ttnn.ReadDeviceProfiler(self.device)
-
-        if acc is None:  # no expert selected (degenerate) -> zeros
-            acc = ttnn.multiply(x_flat, 0.0)
-        return acc
+        outs = [
+            self._decode_token(ttnn.slice(x_flat, [0, 0, ti, 0], [1, 1, ti + 1, self.hidden]), rw_host[ti])
+            for ti in range(t)
+        ]
+        return ttnn.concat(outs, dim=2)  # [1, 1, T, H]
 
 
 class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):

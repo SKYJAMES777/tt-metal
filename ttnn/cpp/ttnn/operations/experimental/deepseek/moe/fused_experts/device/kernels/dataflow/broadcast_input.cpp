@@ -47,7 +47,9 @@
 //   17: sem_gather
 //   18: sem_bcast
 //   19: num_weights
-//   20+: TensorAccessorArgs(input_tensor), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   20: cb_rscalar
+//   21+: TensorAccessorArgs(input_tensor), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   then: gate_up base addresses (one per expert), then down base addresses (one per expert)
 //
 // Runtime args:
 //   0: input_tensor base address
@@ -55,7 +57,6 @@
 //   3: mcast_end_x     4: mcast_end_y
 //   5: num_dests       (number of receiver cores = total cores - 1)
 //   6: col_start_tile  (this core's first output tile)
-//   7 ..: gate_up base addresses (one per expert), then down base addresses (one per expert)
 void kernel_main() {
     constexpr uint32_t cb_input_id = get_compile_time_arg_val(0);
     constexpr uint32_t input_page_size = get_compile_time_arg_val(1);
@@ -82,6 +83,10 @@ void kernel_main() {
     constexpr auto input_args = TensorAccessorArgs<21>();
     constexpr auto gate_up_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
+    // The gate_up then down weight base addresses (one per expert) follow the accessor args
+    // in the compile-time args, indexed by the runtime-selected expert id.
+    constexpr uint32_t kGateUpAddrBase = down_args.next_compile_time_args_offset();
+    constexpr uint32_t kDownAddrBase = kGateUpAddrBase + num_weights;
 
     const uint32_t input_addr = get_arg_val<uint32_t>(0);
     const uint32_t mcast_start_x = get_arg_val<uint32_t>(1);
@@ -90,8 +95,6 @@ void kernel_main() {
     const uint32_t mcast_end_y = get_arg_val<uint32_t>(4);
     const uint32_t num_dests = get_arg_val<uint32_t>(5);
     const uint32_t col_start_tile = get_arg_val<uint32_t>(6);
-    constexpr uint32_t kGateUpAddrBase = 7;
-    constexpr uint32_t kDownAddrBase = kGateUpAddrBase + num_weights;
 
     // Use NoC 1 ("the other NoC") so this runs in parallel with the {0,0} sender on NoC 0.
     Noc noc(1);

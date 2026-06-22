@@ -436,19 +436,21 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     for (const auto& w : tensor_args.gate_up_weights) {
         gate_up_addrs.push_back(static_cast<uint32_t>(w.buffer()->address()));
     }
-    // down weight base addresses, in expert-id order (indexed by routing-selected hit id),
-    // appended to the runtime args right after the gate_up addresses.
+    // down weight base addresses, in expert-id order (indexed by routing-selected hit id).
     std::vector<uint32_t> down_addrs;
     down_addrs.reserve(num_weights);
     for (const auto& w : tensor_args.down_weights) {
         down_addrs.push_back(static_cast<uint32_t>(w.buffer()->address()));
     }
-    auto append_addrs = [&](KernelDescriptor::CoreRuntimeArgs& args) {
+    // The weight addresses are compile-time args: appended (gate_up then down, expert-id order)
+    // to each reader kernel's compile_time_args right after its TensorAccessorArgs. The kernels
+    // index the resident kernel_compile_time_args array by the runtime-selected expert id.
+    auto append_addrs_ct = [&](std::vector<uint32_t>& ct_args) {
         for (uint32_t a : gate_up_addrs) {
-            args.push_back(a);
+            ct_args.push_back(a);
         }
         for (uint32_t a : down_addrs) {
-            args.push_back(a);
+            ct_args.push_back(a);
         }
     };
 
@@ -467,6 +469,7 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     TensorAccessorArgs(*routing_buffer).append_to(sender_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(sender_ct_args);
     TensorAccessorArgs(*down0_buffer).append_to(sender_ct_args);
+    append_addrs_ct(sender_ct_args);
 
     KernelDescriptor sender_desc;
     sender_desc.kernel_source = std::string(kKernelDir) + "/dataflow/compute_expert_ids.cpp";
@@ -487,7 +490,6 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
             num_dests,
             col_start_tile_for(sender),
         };
-        append_addrs(args);
         sender_desc.runtime_args.emplace_back(sender, std::move(args));
     }
     desc.kernels.push_back(std::move(sender_desc));
@@ -502,6 +504,7 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     TensorAccessorArgs(*input_buffer).append_to(input_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(input_ct_args);
     TensorAccessorArgs(*down0_buffer).append_to(input_ct_args);
+    append_addrs_ct(input_ct_args);
 
     KernelDescriptor input_sender_desc;
     input_sender_desc.kernel_source = std::string(kKernelDir) + "/dataflow/broadcast_input.cpp";
@@ -523,7 +526,6 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
             num_dests,
             col_start_tile_for(input_sender),
         };
-        append_addrs(args);
         input_sender_desc.runtime_args.emplace_back(input_sender, std::move(args));
     }
     desc.kernels.push_back(std::move(input_sender_desc));
@@ -537,6 +539,7 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     };
     TensorAccessorArgs(*gate_up0_buffer).append_to(receiver_ct_args);
     TensorAccessorArgs(*down0_buffer).append_to(receiver_ct_args);
+    append_addrs_ct(receiver_ct_args);
 
     KernelDescriptor receiver_desc;
     receiver_desc.kernel_source = std::string(kKernelDir) + "/dataflow/wait_expert_ids.cpp";
@@ -549,9 +552,7 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     };
     for (const auto& cr : receiver_cores.ranges()) {
         for (const auto& core : cr) {
-            KernelDescriptor::CoreRuntimeArgs args{col_start_tile_for(core)};
-            append_addrs(args);
-            receiver_desc.runtime_args.emplace_back(core, std::move(args));
+            receiver_desc.runtime_args.emplace_back(core, KernelDescriptor::CoreRuntimeArgs{col_start_tile_for(core)});
         }
     }
     desc.kernels.push_back(std::move(receiver_desc));

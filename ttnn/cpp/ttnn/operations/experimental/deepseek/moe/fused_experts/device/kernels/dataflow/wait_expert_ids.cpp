@@ -37,11 +37,12 @@
 //   15: sem_gather
 //   16: sem_bcast
 //   17: num_weights
-//   18+: TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   18: cb_rscalar
+//   19+: TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   then: gate_up base addresses (one per expert), then down base addresses (one per expert)
 //
 // Runtime args:
 //   0: col_start_tile  (this core's first output tile)
-//   1 ..: gate_up base addresses (one per expert), then down base addresses (one per expert)
 void kernel_main() {
     constexpr uint32_t sem_id = get_compile_time_arg_val(0);
     constexpr uint32_t sem_input_id = get_compile_time_arg_val(1);
@@ -65,10 +66,12 @@ void kernel_main() {
 
     constexpr auto gate_up_args = TensorAccessorArgs<19>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
+    // The gate_up then down weight base addresses (one per expert) follow the accessor args
+    // in the compile-time args, indexed by the runtime-selected expert id.
+    constexpr uint32_t kGateUpAddrBase = down_args.next_compile_time_args_offset();
+    constexpr uint32_t kDownAddrBase = kGateUpAddrBase + num_weights;
 
     const uint32_t col_start_tile = get_arg_val<uint32_t>(0);
-    constexpr uint32_t kGateUpAddrBase = 1;
-    constexpr uint32_t kDownAddrBase = kGateUpAddrBase + num_weights;
 
     // Activation arrived via multicast: publish it to the compute kernel.
     Semaphore<>(sem_input_id).wait(1);

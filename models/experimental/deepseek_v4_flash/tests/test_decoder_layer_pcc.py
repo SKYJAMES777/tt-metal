@@ -27,6 +27,13 @@ touches ttnn.
 The routed experts live on device in bf16 (one layer fits the Blackhole DRAM),
 so the only precision gap vs the fp32 reference is bf16 device arithmetic.
 
+``test_decoder_layer_decode_pcc`` reuses the same reference bundle to exercise
+the **decode** path (``DeepSeekV4DecoderLayer.decode``, ``T == 1``), whose routed
+MoE runs the single-op ``fused_experts`` kernel: it seeds the layer's KV /
+compressor cache with a tile-aligned prefix, then decodes the next few tokens one
+step at a time and PCC-compares each against the reference's full-prefill row at
+the same position (decode is the per-token-equivalent of a full prefill).
+
 Set ``DEEPSEEK_V4_CACHE_DIR=<dir>`` to skip the slow weight loading on reruns:
 the converted ttnn weight tiles are dumped/reused (the 256-expert dequant is
 skipped entirely on a hit) and the HF reference bundle is cached too, so the
@@ -189,6 +196,7 @@ def _reference_main() -> None:
                 "o_groups": config.o_groups,
                 "o_lora_rank": config.o_lora_rank,
                 "rms_norm_eps": config.rms_norm_eps,
+                "sliding_window": config.sliding_window,
                 "layer_types": list(config.layer_types),
                 "compress_rates": dict(config.compress_rates),
                 "num_local_experts": config.n_routed_experts,
@@ -227,6 +235,7 @@ from models.experimental.deepseek_v4_flash.tt.deepseek_v4_flash import (  # noqa
     DeepSeekV4DecoderLayer,
     DeepSeekV4PreloadedExperts,
     WeightCache,
+    _LayerKVCache,
     make_rope_table,
 )
 from models.experimental.deepseek_v4_flash.tt.quant import dequantize_weight  # noqa: E402
@@ -240,6 +249,15 @@ _SYSTEM_PYTHON = shutil.which("python") or sys.executable
 _THIS_FILE = str(Path(__file__).resolve())
 _MASK_NEG = -1.0e9
 PCC_THRESHOLD = 0.98
+# Decode reuses the *prefill* HF reference: a single-token decode step is the
+# bit-for-bit-equivalent of a full prefill over the same tokens-so-far, so the
+# decoded row at position p must match the reference's full-prefill row p. The
+# decode MoE additionally routes through the single-op ``fused_experts`` kernel
+# (T == 1 on H == 4096), whose bf8 activations widen the gap a touch vs the
+# prefill matmul loop, hence the slightly looser threshold.
+DECODE_PCC_THRESHOLD = 0.97
+# How many tokens to decode (one device step each) past the seeded prefix.
+_DECODE_STEPS = 4
 # Opt-in on-disk cache (ttnn weight tiles + HF reference bundles). ``None`` keeps
 # caching off so every run reloads from the checkpoint (the default behaviour).
 _CACHE_DIR = os.environ.get("DEEPSEEK_V4_CACHE_DIR")
@@ -402,3 +420,114 @@ def test_decoder_layer_pcc(device, reset_seeds, tmp_path, layer_idx: int, batch_
     logger.info(f"[decoder layer {layer_idx} ({layer_type})] PCC: {pcc_message}")
 
     assert passing, f"layer {layer_idx} decoder PCC < {PCC_THRESHOLD}: {pcc_message}"
+
+
+def _rope_rows(cos_half: torch.Tensor, sin_half: torch.Tensor, device) -> tuple:
+    """``(cos, sin, neg_sin)`` ttnn tables for a half-table slice (see ``make_rope_table``)."""
+    cos_full, sin_full = make_rope_table(cos_half, sin_half)
+    return _to_tt(cos_full, device), _to_tt(sin_full, device), _to_tt(-sin_full, device)
+
+
+@pytest.mark.skipif(not _checkpoint_available(), reason=f"V4-Flash checkpoint not found under {_DEFAULT_MODEL_DIR}")
+@torch.no_grad()
+@pytest.mark.parametrize("layer_idx", (4, 5))  # 4 = CSA + moe, 5 = HCA + moe
+@pytest.mark.parametrize("seq_len", (256,))
+@pytest.mark.parametrize("batch_size", (1,))
+def test_decoder_layer_decode_pcc(device, reset_seeds, tmp_path, layer_idx: int, batch_size: int, seq_len: int) -> None:
+    """Decode-path PCC for ``DeepSeekV4DecoderLayer.decode`` (the ``fused_experts`` op).
+
+    Decode is the per-token-equivalent of a full prefill, so this reuses the same
+    HF reference bundle as :func:`test_decoder_layer_pcc`: we seed the layer's
+    sliding-K=V + compressor cache by prefilling the first ``seq_len - 32`` tokens,
+    then decode the next ``_DECODE_STEPS`` tokens one device step at a time and
+    PCC-compare each decoded row against the reference's full-prefill row at the
+    same absolute position. Each decode step runs the routed MoE through the
+    single-op ``fused_experts`` kernel (``T == 1`` on the real ``H == 4096``).
+    """
+    ref_path, need_gen = _reference_path(tmp_path, f"decoder_layer_{layer_idx}_{batch_size}_{seq_len}")
+    # A bundle cached before ``sliding_window`` was added lacks the field the
+    # decode cache needs -- regenerate it so the sliding cap matches the reference.
+    if not need_gen and "sliding_window" not in torch.load(ref_path, weights_only=False)["config"]:
+        need_gen = True
+    if need_gen and not _generate_reference(ref_path, layer_idx, batch_size, seq_len):
+        pytest.skip(f"could not generate HF reference for layer {layer_idx}")
+
+    bundle = torch.load(ref_path, weights_only=False)
+    cfg = types.SimpleNamespace(**bundle["config"])
+    layer_type = bundle["layer_type"]
+    is_compressor = layer_type != "sliding_attention"
+
+    loader = DeepseekV4WeightLoader(_DEFAULT_MODEL_DIR)
+    cache = _weight_cache(layer_idx)
+    weights = _build_layer_weights(loader, layer_idx, layer_type)
+    experts = DeepSeekV4PreloadedExperts(
+        cfg,
+        _expert_provider(loader, layer_idx),
+        device,
+        dtype=ttnn.bfloat16,
+        cache=cache.sub("mlp") if cache else None,
+    )
+    layer = DeepSeekV4DecoderLayer(cfg, layer_idx, weights, device, experts=experts, cache=cache)
+
+    streams = bundle["streams"]  # [B, S, hc_mult, D]
+    reference = bundle["output"].to(torch.float32)  # full-prefill output [B, S, hc_mult, D]
+
+    # ---- seed the cache with a tile-aligned prefix (positions 0 .. split-1) ---- #
+    split = seq_len - 32  # one tile of room so the decode steps have reference rows
+    assert split % 32 == 0 and split + _DECODE_STEPS <= seq_len
+
+    full_mask = bundle["mask"].clamp_min(_MASK_NEG)  # [B,1,S,S(+n_win)]
+    sliding_block = full_mask[:, :, :split, :split]
+    cr = cfg.compress_rates[layer_type] if is_compressor else None
+    if is_compressor:
+        nwin_pre = split // cr
+        mask_pre = torch.cat([sliding_block, full_mask[:, :, :split, seq_len : seq_len + nwin_pre]], dim=-1)
+    else:
+        mask_pre = sliding_block
+
+    cos_pre, sin_pre, neg_sin_pre = _rope_rows(bundle["cos_q"][:split], bundle["sin_q"][:split], device)
+    cos_win_pre = sin_win_pre = None
+    if is_compressor:
+        cw, sw = make_rope_table(bundle["cos_win"][: split // cr], bundle["sin_win"][: split // cr])
+        cos_win_pre = _to_tt(cw, device)
+        sin_win_pre = _to_tt(sw, device)
+
+    kv_cache = _LayerKVCache(cfg.sliding_window, is_compressor)
+    layer.forward(
+        _to_tt(streams[:, :split], device),
+        cos_pre,
+        sin_pre,
+        neg_sin_pre,
+        _to_tt(mask_pre, device),
+        cos_win=cos_win_pre,
+        sin_win=sin_win_pre,
+        kv_cache=kv_cache,
+        cache_len=split,
+    )
+
+    # ---- decode the next few tokens (one device step each) against the cache --- #
+    for pos in range(split, split + _DECODE_STEPS):
+        cos_d, sin_d, neg_sin_d = _rope_rows(bundle["cos_q"][pos : pos + 1], bundle["sin_q"][pos : pos + 1], device)
+        cos_win_d = sin_win_d = None
+        if is_compressor:
+            n_win = (pos + 1) // cr
+            cw, sw = make_rope_table(bundle["cos_win"][:n_win], bundle["sin_win"][:n_win])
+            cos_win_d = _to_tt(cw, device)
+            sin_win_d = _to_tt(sw, device)
+
+        out_tt = layer.decode(
+            _to_tt(streams[:, pos : pos + 1], device),
+            cos_d,
+            sin_d,
+            neg_sin_d,
+            cos_win_d,
+            sin_win_d,
+            kv_cache,
+        )
+        ref_row = reference[:, pos : pos + 1]
+        out_torch = ttnn.to_torch(out_tt).reshape(ref_row.shape).to(torch.float32)
+
+        passing, pcc_message = comp_pcc(ref_row, out_torch, pcc=DECODE_PCC_THRESHOLD)
+        logger.info(comp_allclose(ref_row, out_torch))
+        logger.info(f"[decode layer {layer_idx} ({layer_type}) pos {pos}] PCC: {pcc_message}")
+        assert passing, f"layer {layer_idx} decode pos {pos} PCC < {DECODE_PCC_THRESHOLD}: {pcc_message}"

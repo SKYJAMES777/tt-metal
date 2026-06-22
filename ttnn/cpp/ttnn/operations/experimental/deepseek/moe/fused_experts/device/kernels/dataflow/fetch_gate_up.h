@@ -12,6 +12,7 @@
 #include "api/core_local_mem.h"
 #include "api/tensor/noc_traits.h"
 #include "api/tensor/tensor_accessor.h"
+#include "api/compile_time_args.h"
 
 // Shared dataflow helpers for the fused-experts pipeline (used by every DM kernel).
 //
@@ -61,14 +62,16 @@ inline void fetch_gate_up_one(
     uint32_t tile_bytes,
     uint32_t shard_id,
     const GateUpArgs& gate_up_args,
-    uint32_t rt_w_addr_base) {
+    uint32_t ct_w_addr_base) {
     const uint32_t slice_tiles = k_tiles * kGateUpShardTileCols;
     const uint32_t slice_bytes = slice_tiles * tile_bytes;
 
     CircularBuffer cb_bcast(cb_bcast_id);
     CoreLocalMem<volatile uint32_t> ids(cb_bcast.get_write_ptr());
     const uint32_t expert = ids[i];
-    const uint32_t w_addr = get_arg_val<uint32_t>(rt_w_addr_base + expert);
+    // Weight base addresses live in the compile-time args (in expert-id order); index the
+    // resident kernel_compile_time_args array by the runtime-selected expert id directly.
+    const uint32_t w_addr = kernel_compile_time_args[ct_w_addr_base + expert];
     const auto w = TensorAccessor(gate_up_args, w_addr);
 
     CircularBuffer cb_weights(cb_weights_id);
@@ -95,13 +98,15 @@ inline void fetch_down_one(
     uint32_t down_tile_bytes,
     uint32_t shard_id,
     const DownArgs& down_args,
-    uint32_t rt_down_addr_base) {
+    uint32_t ct_down_addr_base) {
     const uint32_t slice_bytes = down_slice_tiles * down_tile_bytes;
 
     CircularBuffer cb_bcast(cb_bcast_id);
     CoreLocalMem<volatile uint32_t> ids(cb_bcast.get_write_ptr());
     const uint32_t expert = ids[i];
-    const uint32_t w_addr = get_arg_val<uint32_t>(rt_down_addr_base + expert);
+    // Weight base addresses live in the compile-time args (in expert-id order); index the
+    // resident kernel_compile_time_args array by the runtime-selected expert id directly.
+    const uint32_t w_addr = kernel_compile_time_args[ct_down_addr_base + expert];
     const auto w = TensorAccessor(down_args, w_addr);
 
     CircularBuffer cb_down_w(cb_down_w_id);
@@ -237,9 +242,9 @@ inline void run_reader_loop(
     uint32_t mcast_end_y,
     uint32_t num_dests,
     const GateUpArgs& gate_up_args,
-    uint32_t rt_gu_addr_base,
+    uint32_t ct_gu_addr_base,
     const DownArgs& down_args,
-    uint32_t rt_down_addr_base,
+    uint32_t ct_down_addr_base,
     uint32_t cb_rscalar_id,
     uint32_t weight_base) {
     const bool swiglu_core = col_start_tile < i_tiles;
@@ -261,7 +266,7 @@ inline void run_reader_loop(
                 gate_up_tile_bytes,
                 shard_id,
                 gate_up_args,
-                rt_gu_addr_base);
+                ct_gu_addr_base);
         }
     }
 
@@ -296,6 +301,6 @@ inline void run_reader_loop(
             down_tile_bytes,
             shard_id,
             down_args,
-            rt_down_addr_base);
+            ct_down_addr_base);
     }
 }

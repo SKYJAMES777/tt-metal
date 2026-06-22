@@ -46,7 +46,9 @@
 //   19: num_producers (number of SwiGLU cores == I/64)
 //   20: sem_gather
 //   21: sem_bcast
-//   22+: TensorAccessorArgs(routing_weights), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   22: cb_rscalar
+//   23+: TensorAccessorArgs(routing_weights), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   then: gate_up base addresses (one per expert), then down base addresses (one per expert)
 //
 // Runtime args:
 //   0: routing_weights base address
@@ -54,7 +56,6 @@
 //   3: mcast_end_x     4: mcast_end_y
 //   5: num_dests       (number of receiver cores = total cores - 1)
 //   6: col_start_tile  (this core's first output tile)
-//   7 ..: gate_up base addresses (one per expert), then down base addresses (one per expert)
 void kernel_main() {
     constexpr uint32_t num_weights = get_compile_time_arg_val(0);
     constexpr uint32_t num_active = get_compile_time_arg_val(1);
@@ -83,6 +84,10 @@ void kernel_main() {
     constexpr auto routing_args = TensorAccessorArgs<23>();
     constexpr auto gate_up_args = TensorAccessorArgs<routing_args.next_compile_time_args_offset()>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
+    // The gate_up then down weight base addresses (one per expert) follow the accessor args
+    // in the compile-time args, indexed by the runtime-selected expert id.
+    constexpr uint32_t kGateUpAddrBase = down_args.next_compile_time_args_offset();
+    constexpr uint32_t kDownAddrBase = kGateUpAddrBase + num_weights;
 
     const uint32_t routing_addr = get_arg_val<uint32_t>(0);
     const uint32_t mcast_start_x = get_arg_val<uint32_t>(1);
@@ -91,8 +96,6 @@ void kernel_main() {
     const uint32_t mcast_end_y = get_arg_val<uint32_t>(4);
     const uint32_t num_dests = get_arg_val<uint32_t>(5);
     const uint32_t col_start_tile = get_arg_val<uint32_t>(6);
-    constexpr uint32_t kGateUpAddrBase = 7;
-    constexpr uint32_t kDownAddrBase = kGateUpAddrBase + num_weights;
 
     // Pin the expert-id sender to NoC 0; the input broadcaster on {1,0} uses NoC 1.
     Noc noc(0);
