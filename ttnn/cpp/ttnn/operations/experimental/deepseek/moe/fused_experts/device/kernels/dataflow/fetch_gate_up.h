@@ -111,54 +111,40 @@ inline void fetch_down_one(
     cb_down_w.push_back(down_slice_tiles);
 }
 
-// Leader ({0,0}) side of the act gather + broadcast for one expert.
+// Leader ({0,0}) side of the SINGLE activation gather + broadcast for ALL experts.
 //
-// Sequence (cumulative semaphore thresholds avoid per-expert resets and their races):
-//   1. Wait for every core to have freed cb_act from the previous expert (actfree) so the
-//      single-buffered cb_act -- which the leader uses as the gather sink AND the local
-//      compute input -- is safe to overwrite.
-//   2. Reserve cb_act and signal the SwiGLU cores (gather_ready) that they may now scatter
-//      their activation chunk into the leader's cb_act for this expert. Gating the scatter
-//      on this avoids producers clobbering the leader's still-in-use cb_act.
-//   3. Wait for all `num_producers` chunks to land (gather).
-//   4. Multicast the full activation to every other core's cb_act (broadcast) and publish it
-//      to the local compute kernel.
-inline void leader_gather_broadcast(
+// By the time this runs, every SwiGLU core has produced all `num_active` activation slices
+// (phase 1) and its writer has scattered them into the leader's cb_act -- expert e's chunk
+// for core idx at tile offset (e*i_tiles + idx*2). cb_act therefore holds the full
+// [num_active, I] activation block once all `num_producers * num_active` chunks have landed.
+// The leader then multicasts the whole block to every other core in one shot and publishes
+// it locally. Because cb_act is never reused across experts (it holds them all at once), no
+// per-expert back-pressure is needed -- a single gather wait + a single broadcast suffice.
+inline void leader_gather_broadcast_all(
     const Noc& noc,
     uint32_t cb_act_id,
-    uint32_t i_tiles,
+    uint32_t act_total_tiles,
     uint32_t act_tile_bytes,
-    uint32_t e,
-    uint32_t num_producers,
-    uint32_t num_cores,
+    uint32_t gather_count,
     uint32_t sem_gather_id,
     uint32_t sem_bcast_id,
-    uint32_t sem_actfree_id,
-    uint32_t sem_gather_ready_id,
     uint32_t mcast_start_x,
     uint32_t mcast_start_y,
     uint32_t mcast_end_x,
     uint32_t mcast_end_y,
     uint32_t num_dests) {
-    if (e > 0) {
-        Semaphore<>(sem_actfree_id).wait_min(num_cores * e);
-    }
-
     CircularBuffer cb_act(cb_act_id);
-    cb_act.reserve_back(i_tiles);
+    cb_act.reserve_back(act_total_tiles);
     const uint32_t act_l1 = cb_act.get_write_ptr();
 
-    // cb_act is free now -> let the SwiGLU cores scatter their chunks for this expert.
-    Semaphore<> ready(sem_gather_ready_id);
-    ready.set(e + 1);
-    ready.set_multicast(noc, mcast_start_x, mcast_start_y, mcast_end_x, mcast_end_y, num_dests, /*linked=*/false);
+    // Single synchronization point: wait for every expert's chunk from every SwiGLU core.
+    Semaphore<>(sem_gather_id).wait_min(gather_count);
 
-    Semaphore<>(sem_gather_id).wait_min(num_producers * (e + 1));
-
+    // Broadcast the whole [num_active, I] activation block to every other core's cb_act.
     noc.async_write_multicast(
         CoreLocalMem<uint32_t>(act_l1),
         MulticastEndpoint{},
-        i_tiles * act_tile_bytes,
+        act_total_tiles * act_tile_bytes,
         num_dests,
         {.offset_bytes = 0},
         {.noc_x_start = mcast_start_x,
@@ -170,24 +156,30 @@ inline void leader_gather_broadcast(
     noc.async_write_barrier();
 
     Semaphore<> sem(sem_bcast_id);
-    sem.set(e + 1);
+    sem.set(1);
     sem.set_multicast(noc, mcast_start_x, mcast_start_y, mcast_end_x, mcast_end_y, num_dests, /*linked=*/false);
 
-    cb_act.push_back(i_tiles);
+    cb_act.push_back(act_total_tiles);
 }
 
-// Non-leader side: wait for the leader's broadcast of expert e's activation, then publish
-// the (already-resident) full activation to the local compute kernel.
-inline void receiver_recv_act(uint32_t cb_act_id, uint32_t i_tiles, uint32_t e, uint32_t sem_bcast_id) {
-    Semaphore<>(sem_bcast_id).wait_min(e + 1);
+// Non-leader side: wait for the leader's single broadcast of the full [num_active, I]
+// activation block, then publish it (already resident) to the local compute kernel.
+inline void receiver_recv_act_all(uint32_t cb_act_id, uint32_t act_total_tiles, uint32_t sem_bcast_id) {
+    Semaphore<>(sem_bcast_id).wait_min(1);
     CircularBuffer cb_act(cb_act_id);
-    cb_act.reserve_back(i_tiles);
-    cb_act.push_back(i_tiles);
+    cb_act.reserve_back(act_total_tiles);
+    cb_act.push_back(act_total_tiles);
 }
 
-// Per-core reader loop shared by all DM reader kernels. For each selected expert it fetches
-// this core's gate_up slice (SwiGLU cores only) and down slice (all cores), then drives the
-// activation gather/broadcast (leader) or receives it (everyone else).
+// Per-core reader loop shared by all DM reader kernels, structured in two phases around a
+// single synchronization:
+//   Phase 1: fetch this core's gate_up slice for ALL experts (SwiGLU cores only). The compute
+//            kernel produces every expert's SwiGLU activation, which the writer scatters to
+//            the leader.
+//   Sync:    the leader gathers all experts' activations and broadcasts the whole
+//            [num_active, I] block to every core in one shot; everyone else waits for it.
+//   Phase 2: fetch this core's down slice for ALL experts (all cores). The compute kernel
+//            runs the down matmul for every expert against the now-resident activations.
 template <bool IsLeader, typename GateUpArgs, typename DownArgs>
 inline void run_reader_loop(
     const Noc& noc,
@@ -200,15 +192,12 @@ inline void run_reader_loop(
     uint32_t down_tile_bytes,
     uint32_t act_tile_bytes,
     uint32_t num_producers,
-    uint32_t num_cores,
     uint32_t cb_bcast_id,
     uint32_t cb_weights_id,
     uint32_t cb_down_w_id,
     uint32_t cb_act_id,
     uint32_t sem_gather_id,
     uint32_t sem_bcast_id,
-    uint32_t sem_actfree_id,
-    uint32_t sem_gather_ready_id,
     uint32_t mcast_start_x,
     uint32_t mcast_start_y,
     uint32_t mcast_end_x,
@@ -221,8 +210,9 @@ inline void run_reader_loop(
     const bool swiglu_core = col_start_tile < i_tiles;
     const uint32_t shard_id = col_start_tile / kOutTilesPerCore;
 
-    for (uint32_t e = 0; e < num_active; ++e) {
-        if (swiglu_core) {
+    // ---- Phase 1: gate_up weights for all experts (throttled by cb_weights double-buffer). ----
+    if (swiglu_core) {
+        for (uint32_t e = 0; e < num_active; ++e) {
             fetch_gate_up_one(
                 noc,
                 cb_bcast_id,
@@ -234,6 +224,30 @@ inline void run_reader_loop(
                 gate_up_args,
                 rt_gu_addr_base);
         }
+    }
+
+    // ---- Single synchronization: gather all activations + broadcast the whole block. ----
+    const uint32_t act_total_tiles = num_active * i_tiles;
+    if constexpr (IsLeader) {
+        leader_gather_broadcast_all(
+            noc,
+            cb_act_id,
+            act_total_tiles,
+            act_tile_bytes,
+            num_producers * num_active,
+            sem_gather_id,
+            sem_bcast_id,
+            mcast_start_x,
+            mcast_start_y,
+            mcast_end_x,
+            mcast_end_y,
+            num_dests);
+    } else {
+        receiver_recv_act_all(cb_act_id, act_total_tiles, sem_bcast_id);
+    }
+
+    // ---- Phase 2: down weights for all experts (throttled by cb_down_w double-buffer). ----
+    for (uint32_t e = 0; e < num_active; ++e) {
         fetch_down_one(
             noc,
             cb_bcast_id,
@@ -244,27 +258,5 @@ inline void run_reader_loop(
             shard_id,
             down_args,
             rt_down_addr_base);
-
-        if constexpr (IsLeader) {
-            leader_gather_broadcast(
-                noc,
-                cb_act_id,
-                i_tiles,
-                act_tile_bytes,
-                e,
-                num_producers,
-                num_cores,
-                sem_gather_id,
-                sem_bcast_id,
-                sem_actfree_id,
-                sem_gather_ready_id,
-                mcast_start_x,
-                mcast_start_y,
-                mcast_end_x,
-                mcast_end_y,
-                num_dests);
-        } else {
-            receiver_recv_act(cb_act_id, i_tiles, e, sem_bcast_id);
-        }
     }
 }

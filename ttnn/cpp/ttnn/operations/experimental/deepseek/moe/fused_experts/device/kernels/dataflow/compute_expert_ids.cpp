@@ -44,12 +44,9 @@
 //   17: down_tile_bytes
 //   18: act_tile_bytes
 //   19: num_producers (number of SwiGLU cores == I/64)
-//   20: num_cores     (compute grid size == 64)
-//   21: sem_gather
-//   22: sem_bcast
-//   23: sem_actfree
-//   24: sem_gather_ready
-//   25+: TensorAccessorArgs(routing_weights), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   20: sem_gather
+//   21: sem_bcast
+//   22+: TensorAccessorArgs(routing_weights), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
 //
 // Runtime args:
 //   0: routing_weights base address
@@ -79,13 +76,10 @@ void kernel_main() {
     constexpr uint32_t down_tile_bytes = get_compile_time_arg_val(17);
     constexpr uint32_t act_tile_bytes = get_compile_time_arg_val(18);
     constexpr uint32_t num_producers = get_compile_time_arg_val(19);
-    constexpr uint32_t num_cores = get_compile_time_arg_val(20);
-    constexpr uint32_t sem_gather_id = get_compile_time_arg_val(21);
-    constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(22);
-    constexpr uint32_t sem_actfree_id = get_compile_time_arg_val(23);
-    constexpr uint32_t sem_gather_ready_id = get_compile_time_arg_val(24);
+    constexpr uint32_t sem_gather_id = get_compile_time_arg_val(20);
+    constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(21);
 
-    constexpr auto routing_args = TensorAccessorArgs<25>();
+    constexpr auto routing_args = TensorAccessorArgs<22>();
     constexpr auto gate_up_args = TensorAccessorArgs<routing_args.next_compile_time_args_offset()>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
 
@@ -151,7 +145,7 @@ void kernel_main() {
     Semaphore<>(sem_input_id).wait(1);
     publish_input(cb_input_id, k_tiles);
 
-    // ---- 5. Per-expert reader loop (leader role): fetch weights + gather/broadcast act. ----
+    // ---- 5. Two-phase reader loop (leader role): all gate_up, single gather+broadcast, all down. ----
     run_reader_loop<true>(
         noc,
         num_active,
@@ -163,15 +157,12 @@ void kernel_main() {
         down_tile_bytes,
         act_tile_bytes,
         num_producers,
-        num_cores,
         cb_bcast_id,
         cb_weights_id,
         cb_down_w_id,
         cb_act_id,
         sem_gather_id,
         sem_bcast_id,
-        sem_actfree_id,
-        sem_gather_ready_id,
         mcast_start_x,
         mcast_start_y,
         mcast_end_x,

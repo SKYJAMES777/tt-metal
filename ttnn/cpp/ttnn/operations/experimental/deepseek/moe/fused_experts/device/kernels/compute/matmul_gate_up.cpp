@@ -80,13 +80,15 @@ void kernel_main() {
 
     mm_init(cb_input_id, cb_weights_id, cb_mm_id);
 
-    // Activation x is broadcast once and reused for every expert's gate_up matmul.
+    // ===================================================================================
+    // PHASE 1: gate_up matmul + SwiGLU for ALL experts (SwiGLU cores only). Each expert's
+    // 2-tile activation slice is pushed to cb_out for the writer to scatter to the leader.
+    // ===================================================================================
     if (swiglu_core) {
+        // Activation x is broadcast once and reused for every expert's gate_up matmul.
         in_cb.wait_front(k_tiles);
-    }
 
-    for (uint32_t e = 0; e < num_active; ++e) {
-        if (swiglu_core) {
+        for (uint32_t e = 0; e < num_active; ++e) {
             w_cb.wait_front(slice_tiles);
 
             // ---- gate + up matmul -> cb_mm (gate tiles 0,1; up tiles 2,3). ----
@@ -165,8 +167,19 @@ void kernel_main() {
             out_cb.push_back(kOutTilesPerCore);
         }
 
-        // ---- down matmul (all cores): cb_act @ cb_down_w -> cb_down_out (2 tiles). ----
-        act_cb.wait_front(i_tiles);
+        in_cb.pop_front(k_tiles);
+    }
+
+    // ===================================================================================
+    // PHASE 2: down matmul for ALL experts (all cores). The single gather + broadcast has
+    // made the whole [num_active, I] activation block resident in cb_act; expert e's
+    // activation occupies tiles [e*i_tiles, (e+1)*i_tiles).
+    // ===================================================================================
+    const uint32_t act_total_tiles = num_active * i_tiles;
+    act_cb.wait_front(act_total_tiles);
+
+    for (uint32_t e = 0; e < num_active; ++e) {
+        const uint32_t act_base = e * i_tiles;  // first activation tile for expert e
         down_w_cb.wait_front(down_slice_tiles);
 
         mm_init_short(cb_act_id, cb_down_w_id);
@@ -177,7 +190,7 @@ void kernel_main() {
         tile_regs_acquire();
         for (uint32_t n = 0; n < kOutTilesPerCore; ++n) {
             for (uint32_t k = 0; k < i_tiles; ++k) {
-                matmul_tiles(cb_act_id, cb_down_w_id, k, k * kOutTilesPerCore + n, n);
+                matmul_tiles(cb_act_id, cb_down_w_id, act_base + k, k * kOutTilesPerCore + n, n);
             }
         }
         tile_regs_commit();
@@ -187,11 +200,8 @@ void kernel_main() {
         tile_regs_release();
 
         down_out_cb.push_back(kOutTilesPerCore);
-        act_cb.pop_front(i_tiles);
         down_w_cb.pop_front(down_slice_tiles);
     }
 
-    if (swiglu_core) {
-        in_cb.pop_front(k_tiles);
-    }
+    act_cb.pop_front(act_total_tiles);
 }

@@ -34,13 +34,10 @@
 //   12: down_tile_bytes
 //   13: act_tile_bytes
 //   14: num_producers
-//   15: num_cores
-//   16: sem_gather
-//   17: sem_bcast
-//   18: sem_actfree
-//   19: num_weights
-//   20: sem_gather_ready
-//   21+: TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   15: sem_gather
+//   16: sem_bcast
+//   17: num_weights
+//   18+: TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
 //
 // Runtime args:
 //   0: col_start_tile  (this core's first output tile)
@@ -61,14 +58,11 @@ void kernel_main() {
     constexpr uint32_t down_tile_bytes = get_compile_time_arg_val(12);
     constexpr uint32_t act_tile_bytes = get_compile_time_arg_val(13);
     constexpr uint32_t num_producers = get_compile_time_arg_val(14);
-    constexpr uint32_t num_cores = get_compile_time_arg_val(15);
-    constexpr uint32_t sem_gather_id = get_compile_time_arg_val(16);
-    constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(17);
-    constexpr uint32_t sem_actfree_id = get_compile_time_arg_val(18);
-    constexpr uint32_t num_weights = get_compile_time_arg_val(19);
-    constexpr uint32_t sem_gather_ready_id = get_compile_time_arg_val(20);
+    constexpr uint32_t sem_gather_id = get_compile_time_arg_val(15);
+    constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(16);
+    constexpr uint32_t num_weights = get_compile_time_arg_val(17);
 
-    constexpr auto gate_up_args = TensorAccessorArgs<21>();
+    constexpr auto gate_up_args = TensorAccessorArgs<18>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
 
     const uint32_t col_start_tile = get_arg_val<uint32_t>(0);
@@ -93,15 +87,12 @@ void kernel_main() {
         down_tile_bytes,
         act_tile_bytes,
         num_producers,
-        num_cores,
         cb_bcast_id,
         cb_weights_id,
         cb_down_w_id,
         cb_act_id,
         sem_gather_id,
         sem_bcast_id,
-        sem_actfree_id,
-        sem_gather_ready_id,
         /*mcast_start_x=*/0,
         /*mcast_start_y=*/0,
         /*mcast_end_x=*/0,

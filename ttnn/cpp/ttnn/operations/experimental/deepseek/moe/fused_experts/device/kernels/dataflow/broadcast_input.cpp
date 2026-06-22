@@ -44,13 +44,10 @@
 //   14: down_tile_bytes
 //   15: act_tile_bytes
 //   16: num_producers
-//   17: num_cores
-//   18: sem_gather
-//   19: sem_bcast
-//   20: sem_actfree
-//   21: num_weights
-//   22: sem_gather_ready
-//   23+: TensorAccessorArgs(input_tensor), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
+//   17: sem_gather
+//   18: sem_bcast
+//   19: num_weights
+//   20+: TensorAccessorArgs(input_tensor), TensorAccessorArgs(gate_up), TensorAccessorArgs(down)
 //
 // Runtime args:
 //   0: input_tensor base address
@@ -77,14 +74,11 @@ void kernel_main() {
     constexpr uint32_t down_tile_bytes = get_compile_time_arg_val(14);
     constexpr uint32_t act_tile_bytes = get_compile_time_arg_val(15);
     constexpr uint32_t num_producers = get_compile_time_arg_val(16);
-    constexpr uint32_t num_cores = get_compile_time_arg_val(17);
-    constexpr uint32_t sem_gather_id = get_compile_time_arg_val(18);
-    constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(19);
-    constexpr uint32_t sem_actfree_id = get_compile_time_arg_val(20);
-    constexpr uint32_t num_weights = get_compile_time_arg_val(21);
-    constexpr uint32_t sem_gather_ready_id = get_compile_time_arg_val(22);
+    constexpr uint32_t sem_gather_id = get_compile_time_arg_val(17);
+    constexpr uint32_t sem_bcast_id = get_compile_time_arg_val(18);
+    constexpr uint32_t num_weights = get_compile_time_arg_val(19);
 
-    constexpr auto input_args = TensorAccessorArgs<23>();
+    constexpr auto input_args = TensorAccessorArgs<20>();
     constexpr auto gate_up_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
     constexpr auto down_args = TensorAccessorArgs<gate_up_args.next_compile_time_args_offset()>();
 
@@ -149,15 +143,12 @@ void kernel_main() {
         down_tile_bytes,
         act_tile_bytes,
         num_producers,
-        num_cores,
         cb_bcast_id,
         cb_weights_id,
         cb_down_w_id,
         cb_act_id,
         sem_gather_id,
         sem_bcast_id,
-        sem_actfree_id,
-        sem_gather_ready_id,
         mcast_start_x,
         mcast_start_y,
         mcast_end_x,

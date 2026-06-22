@@ -8,6 +8,7 @@
 #include <bit>
 #include <string>
 
+#include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 
 namespace ttnn::operations::experimental::deepseek::moe::fused_experts {
@@ -31,21 +32,25 @@ constexpr uint32_t kTilesPerCore = 2;
 uint32_t align_up_32(uint32_t x) { return (x + 31u) & ~31u; }
 }  // namespace
 
-// Pipeline (per selected expert, all cores in lock-step):
+// Pipeline (two phases over all selected experts, with a single synchronization between):
 //   - {0,0} (NoC 0) reads routing weights, computes/broadcasts the selected ("hit")
 //     expert ids (ascending), and acts as the activation-gather leader.
 //   - {1,0} (NoC 1) reads the decode activation row and broadcasts it to every
 //     core's L1 (cb_input).
-//   - gate_up + SwiGLU: each of the 32 SwiGLU cores fetches its [K, 128] gate_up shard
-//     (one NoC read -- a per-core [gate_64 | up_64] block) and produces its 2-tile slice
-//     of the activation act[1, I].
-//   - GATHER + BROADCAST: each SwiGLU core's writer scatters its 2 act tiles to {0,0}'s
-//     cb_act (at tile offset col_start); once {0,0} has all 32 chunks it multicasts the
-//     full act[1, I] back to every core (sem_gather / sem_bcast / sem_actfree sequence).
-//   - DOWN matmul: each of the 64 cores fetches its [I, H/64] down shard (one NoC read)
-//     and multiplies it by the full activation to produce its 2-tile slice of the output
-//     row[1, H], which the writer writes to the [num_active, 1, H] DRAM output (one row
-//     per selected expert).
+//   - PHASE 1 -- gate_up + SwiGLU for ALL experts: each of the I/64 SwiGLU cores fetches
+//     its [K, 128] gate_up shard per expert (one NoC read -- a per-core [gate_64 | up_64]
+//     block) and produces its 2-tile slice of each expert's activation act[1, I]. Each
+//     core's writer scatters expert e's 2 act tiles to {0,0}'s cb_act at tile offset
+//     (e*i_tiles + col_start).
+//   - SINGLE SYNC -- gather + broadcast: once {0,0} has every expert's chunk from every
+//     SwiGLU core (num_producers * num_active in total, via sem_gather), it multicasts the
+//     whole [num_active, I] activation block back to every core in one shot (sem_bcast).
+//     Because cb_act holds all experts at once and is never reused, no per-expert
+//     back-pressure is needed.
+//   - PHASE 2 -- DOWN matmul for ALL experts: each of the 64 cores fetches its [I, H/64]
+//     down shard per expert (one NoC read) and multiplies it by that expert's activation to
+//     produce its 2-tile slice of the output row[1, H], which the writer writes to the
+//     [num_active, 1, H] DRAM output (one row per selected expert).
 ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const operation_attributes_t& operation_attributes,
     const tensor_args_t& tensor_args,
@@ -92,6 +97,12 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const uint32_t weight_slice_tiles = k_tiles * (2u * kTilesPerCore);
     // Double-buffer the weight slice so the reader can prefetch the next expert.
     const uint32_t weights_cb_bytes = 2u * weight_slice_tiles * weight_tile_bytes;
+    log_info(
+        tt::LogOp,
+        "weights_cb_bytes: {}, weight_slice_tiles: {}, weight_tile_bytes: {}",
+        weights_cb_bytes,
+        weight_slice_tiles,
+        weight_tile_bytes);
 
     // down weights are [I, H] per expert (TILE layout), DRAM ND-sharded into [I, H/64]
     // column blocks (one per core). Core idx owns the H output cols [idx*64, idx*64+64) ->
@@ -106,9 +117,8 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const uint32_t down_cb_bytes = 2u * down_slice_tiles * down_tile_bytes;  // double-buffered
     const tt::DataFormat down_df = datatype_to_dataformat_converter(down0.dtype());
 
-    // Number of SwiGLU cores (each produces one [1, 64] activation chunk) and the full grid.
+    // Number of SwiGLU cores (each produces one [1, 64] activation chunk per expert).
     const uint32_t num_producers = i_tiles / kTilesPerCore;  // I / 64
-    const uint32_t num_cores = GRID_X * GRID_Y;
 
     const tt::DataFormat gate_up_df = datatype_to_dataformat_converter(gate_up0.dtype());
     const tt::DataFormat routing_df = datatype_to_dataformat_converter(routing_weights.dtype());
@@ -127,12 +137,17 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
 
     // Output is TILE [num_active, 1, H] bf16 (the down matmul result): each core writes its
     // 2 output tiles (its 64-column H slice) per expert. h_tiles == H/32 is the output page
-    // stride per expert row. The gathered activation is bf16 (== output dtype), so its tile
-    // size matches the output tile size.
-
+    // stride per expert row.
     const uint32_t out_tile_bytes = static_cast<uint32_t>(out_buffer->page_size());
-    const uint32_t h_tiles = down_n_tiles;           // H / 32
-    const uint32_t act_tile_bytes = out_tile_bytes;  // activation tile == bf16 output tile
+    const uint32_t h_tiles = down_n_tiles;  // H / 32
+
+    // The gathered activation is stored as Bfp8_b (not bf16) to keep the resident
+    // [num_active, I] block -- the dominant L1 consumer -- within the L1 budget. The SwiGLU
+    // output (cb_out) is packed in the same format so the writer can scatter it byte-for-byte
+    // into the leader's cb_act, and the down matmul reads it as its bf8 in0 (paired with the
+    // bf4 down weights). The down output stays bf16 to match the DRAM output tensor.
+    const tt::DataFormat act_df = tt::DataFormat::Bfp8_b;
+    const uint32_t act_tile_bytes = tt::tile_size(act_df);
 
     // SwiGLU clamp limit, passed to the compute kernel as a bit-cast float (the kernel
     // derives -limit internally).
@@ -143,20 +158,40 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const uint32_t input_cb_bytes = input_num_pages * input_page_size;
     // Double-buffer the matmul output so compute can run ahead of the writer. Each core
     // produces kOutTilesPerCore SwiGLU output tiles (its 64-column I slice) per expert.
+    // cb_out holds the bf8 SwiGLU activation (== act_df) so the writer can scatter it
+    // directly into cb_act.
     constexpr uint32_t kOutTilesPerCore = 2;
-    const uint32_t out_cb_bytes = 2u * kOutTilesPerCore * out_tile_bytes;
+    const uint32_t out_cb_bytes = 2u * kOutTilesPerCore * act_tile_bytes;
     // Matmul staging buffer (fp32 for full precision before the SwiGLU SFPU pass):
     // 2*kOutTilesPerCore tiles per expert (gate 0,1 | up 2,3), single-buffered.
     const uint32_t mm_tile_bytes = TILE_DIM * TILE_DIM * 4u;
     const uint32_t mm_cb_bytes = 2u * kOutTilesPerCore * mm_tile_bytes;
 
-    // Gathered activation act[1, I] (i_tiles tiles), single-buffered: filled by the gather
-    // on {0,0} and by the broadcast on every other core, consumed by the down matmul. Single
-    // buffering serializes experts (the leader only broadcasts the next expert once all cores
-    // have freed it, via the actfree semaphore).
-    const uint32_t act_cb_bytes = i_tiles * act_tile_bytes;
+    // Gathered activation: the WHOLE [num_active, I] block (num_active * i_tiles tiles),
+    // single-buffered. Filled by the gather on {0,0} (all experts' chunks) and by the single
+    // broadcast on every other core, then consumed by the down matmul for every expert. Sized
+    // for all experts at once so the down phase needs no per-expert synchronization.
+    // NOTE: this is the dominant L1 consumer -- num_active * i_tiles * act_tile_bytes bytes on
+    // EVERY core (e.g. num_active=6, I=2048 -> 6*64*2KB = 768 KB) -- so large num_active / I
+    // can exceed the L1 budget.
+    const uint32_t act_cb_bytes = num_active * i_tiles * act_tile_bytes;
     // Per-core down output (kOutTilesPerCore tiles per expert), double-buffered.
     const uint32_t down_out_cb_bytes = 2u * kOutTilesPerCore * out_tile_bytes;
+
+    // CB reuse: the single gather/broadcast sync is a hard barrier between Phase 1 (gate_up) and
+    // Phase 2 (down), so Phase-1-only buffers are dead during Phase 2 and can host Phase-2-only
+    // buffers in the same L1 -- but ONLY when both share the same producer->consumer RISC pair
+    // (a CB index with two different producers/consumers corrupts its page-sync counters) AND
+    // the same page size (a shared-region CB's total size must be divisible by every page size).
+    //   - down weights reuse cb_weights: both reader -> compute, both Bfp4_b same page, and the
+    //     gate_up weight CB is already >= the down weight slice, so it is reused in place.
+    //   - the down output keeps its own CB (see cb_down_out below): it is compute -> writer (so
+    //     it cannot share any reader -> compute buffer) and bf16, while the only compute ->
+    //     writer buffer (cb_out) is Bfp8_b, so neither constraint is satisfiable.
+    TT_FATAL(
+        gate_up_df == down_df && weight_tile_bytes == down_tile_bytes && weights_cb_bytes >= down_cb_bytes,
+        "fused_experts: down weights reuse cb_weights, which requires a matching Bfp4_b format/page "
+        "and a gate_up weight CB at least as large as the down weight slice");
 
     // Core sets: full grid, the two senders {0,0} (expert ids) and {1,0} (activations),
     // and the 62 receivers.
@@ -197,18 +232,16 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         .core_ranges = all_cores,
         .initial_value = 0,
     });
-    // Down-phase semaphores (all on {0,0}, but allocated on every core for a uniform id):
-    //   sem_gather  : SwiGLU cores bump it after scattering their activation chunk to {0,0}.
-    //   sem_bcast   : {0,0} sets it (== expert index + 1) after broadcasting the activation.
-    //   sem_actfree : every core bumps it after consuming the gathered activation (down done),
-    //                 telling {0,0} the single-buffered cb_act may be reused for the next expert.
-    //   sem_gather_ready : {0,0} sets it (== expert index + 1) once cb_act is free, telling the
-    //                 SwiGLU cores they may scatter their chunk for the next expert.
+    // Down-phase semaphores (all on {0,0}, but allocated on every core for a uniform id).
+    // The two-phase structure (all gate_up, single gather+broadcast, all down) means cb_act
+    // holds every expert's activation at once and is never reused, so only two semaphores are
+    // needed -- no per-expert back-pressure:
+    //   sem_gather : SwiGLU cores bump it after scattering each expert's activation chunk to
+    //                {0,0}; {0,0} waits for all num_producers * num_active chunks (single sync).
+    //   sem_bcast  : {0,0} sets it once after broadcasting the whole [num_active, I] block.
     constexpr uint32_t sem_gather_id = 2;
     constexpr uint32_t sem_bcast_id = 3;
-    constexpr uint32_t sem_actfree_id = 4;
-    constexpr uint32_t sem_gather_ready_id = 5;
-    for (uint32_t s : {sem_gather_id, sem_bcast_id, sem_actfree_id, sem_gather_ready_id}) {
+    for (uint32_t s : {sem_gather_id, sem_bcast_id}) {
         desc.semaphores.push_back(SemaphoreDescriptor{
             .id = s,
             .core_type = CoreType::WORKER,
@@ -266,15 +299,16 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         }}},
     });
 
-    // Per-core SwiGLU output (kOutTilesPerCore tiles per expert), double-buffered.
+    // Per-core SwiGLU output (kOutTilesPerCore tiles per expert), double-buffered. Stored as
+    // Bfp8_b (act_df) so it can be scattered byte-for-byte into the bf8 cb_act.
     constexpr uint32_t cb_out = CBIndex::c_4;
     desc.cbs.push_back(CBDescriptor{
         .total_size = out_cb_bytes,
         .core_ranges = all_cores,
         .format_descriptors = {{CBFormatDescriptor{
             .buffer_index = cb_out,
-            .data_format = out_df,
-            .page_size = out_tile_bytes,
+            .data_format = act_df,
+            .page_size = act_tile_bytes,
         }}},
     });
 
@@ -291,32 +325,34 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         }}},
     });
 
-    // Gathered activation (full act[1, I], i_tiles tiles), single-buffered. Allocated
-    // identically on all cores so the gather scatter / broadcast land at the same L1 address.
+    // Gathered activation (full [num_active, I] block, num_active * i_tiles tiles),
+    // single-buffered. Allocated identically on all cores so the gather scatter / broadcast
+    // land at the same L1 address.
     constexpr uint32_t cb_act = CBIndex::c_6;
     desc.cbs.push_back(CBDescriptor{
         .total_size = act_cb_bytes,
         .core_ranges = all_cores,
         .format_descriptors = {{CBFormatDescriptor{
             .buffer_index = cb_act,
-            .data_format = out_df,
+            .data_format = act_df,
             .page_size = act_tile_bytes,
         }}},
     });
 
-    // Per-core down weight slice ([I, 64] = i_tiles x 2 tiles), double-buffered.
-    constexpr uint32_t cb_down_weights = CBIndex::c_7;
-    desc.cbs.push_back(CBDescriptor{
-        .total_size = down_cb_bytes,
-        .core_ranges = all_cores,
-        .format_descriptors = {{CBFormatDescriptor{
-            .buffer_index = cb_down_weights,
-            .data_format = down_df,
-            .page_size = down_tile_bytes,
-        }}},
-    });
+    // Reuse (Proposal 1): the per-core down weight slice ([I, 64] = i_tiles x 2 tiles) shares
+    // the gate_up weight CB. gate_up (Phase 1) is fully consumed before the sync and down is
+    // fetched only afterwards (Phase 2), so the two never coexist; both are Bfp4_b with the same
+    // page and cb_weights' double-buffered region is larger than the down slice needs.
+    constexpr uint32_t cb_down_weights = cb_weights;
 
-    // Per-core down output (kOutTilesPerCore tiles per expert), double-buffered.
+    // Per-core down output (kOutTilesPerCore tiles per expert), double-buffered. NOTE: this is
+    // NOT merged into another CB. The down output is produced by compute and consumed by the
+    // writer (compute -> writer), so it cannot safely alias any reader -> compute buffer
+    // (cb_input/cb_act/cb_weights) -- a CB index can only have one producer or its page-sync
+    // counters corrupt. The only compatible compute -> writer buffer, cb_out, is Bfp8_b
+    // (1088 B page) while this output is bf16 (2048 B page), and a shared-region CB's total
+    // size must be divisible by every page size (LCM(1088, 2048) = 34816 B), which would use
+    // MORE L1 than keeping them separate. So the down output keeps its own small CB (c_8).
     constexpr uint32_t cb_down_out = CBIndex::c_8;
     desc.cbs.push_back(CBDescriptor{
         .total_size = down_out_cb_bytes,
@@ -372,11 +408,10 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
 
     // ---- Expert-id sender kernel on {0,0} (NoC 0). ----
     std::vector<uint32_t> sender_ct_args = {
-        num_weights,         num_active,    sentinel,        cb_routing,    cb_bcast,         routing_page_bytes,
-        bcast_page_bytes,    sem_id,        cb_weights,      k_tiles,       i_tiles,          weight_tile_bytes,
-        sem_input_id,        cb_input,      cb_down_weights, cb_act,        down_slice_tiles, down_tile_bytes,
-        act_tile_bytes,      num_producers, num_cores,       sem_gather_id, sem_bcast_id,     sem_actfree_id,
-        sem_gather_ready_id,
+        num_weights,      num_active,    sentinel,        cb_routing,   cb_bcast,         routing_page_bytes,
+        bcast_page_bytes, sem_id,        cb_weights,      k_tiles,      i_tiles,          weight_tile_bytes,
+        sem_input_id,     cb_input,      cb_down_weights, cb_act,       down_slice_tiles, down_tile_bytes,
+        act_tile_bytes,   num_producers, sem_gather_id,   sem_bcast_id,
     };
     TensorAccessorArgs(*routing_buffer).append_to(sender_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(sender_ct_args);
@@ -408,29 +443,10 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
 
     // ---- Input-broadcaster kernel on {1,0} (NoC 1). ----
     std::vector<uint32_t> input_ct_args = {
-        cb_input,
-        input_page_size,
-        input_num_pages,
-        sem_input_id,
-        sem_id,
-        num_active,
-        cb_weights,
-        k_tiles,
-        i_tiles,
-        weight_tile_bytes,
-        cb_bcast,
-        cb_down_weights,
-        cb_act,
-        down_slice_tiles,
-        down_tile_bytes,
-        act_tile_bytes,
-        num_producers,
-        num_cores,
-        sem_gather_id,
-        sem_bcast_id,
-        sem_actfree_id,
-        num_weights,
-        sem_gather_ready_id,
+        cb_input,       input_page_size, input_num_pages, sem_input_id,     sem_id,
+        num_active,     cb_weights,      k_tiles,         i_tiles,          weight_tile_bytes,
+        cb_bcast,       cb_down_weights, cb_act,          down_slice_tiles, down_tile_bytes,
+        act_tile_bytes, num_producers,   sem_gather_id,   sem_bcast_id,     num_weights,
     };
     TensorAccessorArgs(*input_buffer).append_to(input_ct_args);
     TensorAccessorArgs(*gate_up0_buffer).append_to(input_ct_args);
@@ -478,12 +494,9 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         down_tile_bytes,
         act_tile_bytes,
         num_producers,
-        num_cores,
         sem_gather_id,
         sem_bcast_id,
-        sem_actfree_id,
         num_weights,
-        sem_gather_ready_id,
     };
     TensorAccessorArgs(*gate_up0_buffer).append_to(receiver_ct_args);
     TensorAccessorArgs(*down0_buffer).append_to(receiver_ct_args);
@@ -548,8 +561,6 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         act_tile_bytes,
         out_tile_bytes,
         sem_gather_id,
-        sem_actfree_id,
-        sem_gather_ready_id,
     };
     TensorAccessorArgs(*out_buffer).append_to(writer_ct_args);
 
