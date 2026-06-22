@@ -9,6 +9,7 @@
 
 #include "ttnn/core.hpp"
 #include "ttnn/device_operation.hpp"
+#include "ttnn/operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/types.hpp"
 #include <tt-metalium/program_descriptors.hpp>
@@ -45,6 +46,11 @@ struct FusedExpertsDeviceOperation {
 
     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
     static void validate_on_program_cache_hit(const operation_attributes_t&, const tensor_args_t&);
+
+    // The per-expert weight DRAM addresses are baked into the kernels as compile-time args, so the
+    // default (spec-only) program hash would reuse a stale program when only the weight tensors
+    // change. Fold the weight addresses into the hash so different weights miss the program cache.
+    static tt::tt_metal::operation::Hash compute_program_hash(const operation_attributes_t&, const tensor_args_t&);
 
     static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
     static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);

@@ -10,18 +10,21 @@ exercising the full prefill front-end of the model: embedding, the
 ``hash_moe``), sliding attention (layers 0-1) and compressed-sparse attention
 (layer 2), and both HyperConnections per layer.
 
-Dual-interpreter, like the other V4 PCC tests:
+Two-process, like the other V4 PCC tests:
 
-* **reference side** (``__main__``, *system* interpreter): builds the three HF
-  ``transformers==5.8.1`` ``DeepseekV4DecoderLayer``s, loads the real
+* **reference side** (``__main__``, a fresh subprocess): builds the three HF
+  ``DeepseekV4DecoderLayer``s (``transformers>=5.10``), loads the real
   (dequantized) checkpoint weights into them, tokenizes the text, runs the
   embedding + 3 layers, and dumps the per-layer RoPE tables / masks, the
-  ``input_ids``, and the final residual-stream stack.
+  ``input_ids``, and the final residual-stream stack. Run as its own process so
+  the heavy HF build never touches the ttnn runtime held by the pytest process.
 * **pytest side** (ttnn venv): runs the ttnn embedding + 3 ttnn decoder layers
   from the *same* loader and PCC-compares the final stream stack.
 
-The routed experts live on device in ``bfloat8_b`` so all three layers' 256
-experts fit the Blackhole DRAM at once.
+The routed experts live on device in ``bfloat4_b`` (the ``fused_experts`` op's
+design dtype -- its per-core circular buffers are sized for the bf4 weight slice
+and overflow L1 at wider dtypes), so all three layers' 256 experts fit the
+Blackhole DRAM at once.
 
 Set ``DEEPSEEK_V4_CACHE_DIR=<dir>`` to skip the slow weight loading on reruns:
 the converted ttnn weight tiles are dumped/reused (the per-layer 256-expert
@@ -38,7 +41,6 @@ from pathlib import Path
 import torch
 
 
-_CACHED_TRANSFORMERS = "/home/ttuser/.cache/uv/archive-v0/U5SPsIWJupLz-bDcPI13a"
 _DEFAULT_MODEL_DIR = "/home/ttuser/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash"
 _N_LAYERS = 3
 _DEFAULT_TEXT = "The quick brown fox jumps over the lazy dog near the riverbank at dawn."
@@ -66,10 +68,15 @@ def _reference_block_bias(
 
 
 # --------------------------------------------------------------------------- #
-# Reference side (executed only as ``__main__`` under the system interpreter).
+# Reference side (executed only as ``__main__`` in the reference subprocess).
 # --------------------------------------------------------------------------- #
 def _ref_load_layer_weights(layer, loader, quant, layer_idx: int) -> None:
     def w(name: str) -> torch.Tensor:
+        # transformers >= 5.10 nests the lightning-indexer scoring head under an
+        # extra ``indexer.scorer`` module (``DeepseekV4IndexerScorer``); the
+        # checkpoint still stores ``weights_proj`` flat on the indexer, so drop the
+        # ``scorer`` segment to match the loader's HF -> checkpoint name map.
+        name = name.replace(".indexer.scorer.", ".indexer.")
         full = f"layers.{layer_idx}.{name}"
         return quant.dequantize_weight(loader.get_tensor(full), loader.get_scale(full)).to(torch.float32)
 
@@ -98,7 +105,6 @@ def _reference_main() -> None:
 
     _orig_version = _md.version
     _md.version = lambda name: "0.22.0" if name.lower() == "tokenizers" else _orig_version(name)
-    sys.path.insert(0, _CACHED_TRANSFORMERS)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tt"))
 
     import weight_loader as WL  # noqa: E402
@@ -166,6 +172,7 @@ def _reference_main() -> None:
                 attention_mask=mask,
                 past_key_values=None,
             )
+            entry["stream_out"] = streams.contiguous()  # per-layer reference for localized PCC
             per_layer.append(entry)
             del layer
 
@@ -376,7 +383,7 @@ def test_first_layers_real_text_pcc(device, reset_seeds, tmp_path, text: str) ->
             cfg,
             _expert_provider(loader, li),
             device,
-            dtype=ttnn.bfloat8_b,
+            dtype=ttnn.bfloat4_b,
             cache=layer_cache.sub("mlp") if layer_cache else None,
         )
         layer = DeepSeekV4DecoderLayer(cfg, li, weights, device, experts=experts, gate=gate, cache=layer_cache)
@@ -403,6 +410,15 @@ def test_first_layers_real_text_pcc(device, reset_seeds, tmp_path, text: str) ->
             sin_win=sin_win_tt,
             input_ids=input_ids,
         )
+
+        if "stream_out" in entry:
+            cur = ttnn.to_torch(streams_tt).reshape(entry["stream_out"].shape).to(torch.float32)
+            ref_cur = entry["stream_out"].to(torch.float32)
+            _, msg = comp_pcc(ref_cur, cur, pcc=PCC_THRESHOLD)
+            logger.info(
+                f"[layer {li} ({layer_type})] PCC: {msg} | tt nan={torch.isnan(cur).any().item()} "
+                f"inf={torch.isinf(cur).any().item()} min={cur.min().item():.3f} max={cur.max().item():.3f}"
+            )
 
     out_torch = ttnn.to_torch(streams_tt).reshape(bundle["output"].shape).to(torch.float32)
     reference = bundle["output"].to(torch.float32)

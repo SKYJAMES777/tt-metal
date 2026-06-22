@@ -163,6 +163,38 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_hit(
     validate_on_program_cache_miss(attributes, tensor_args);
 }
 
+tt::tt_metal::operation::Hash FusedExpertsDeviceOperation::compute_program_hash(
+    const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
+    // CRITICAL: the per-expert gate_up / down weight DRAM base addresses are baked into the
+    // dataflow kernels as COMPILE-TIME args (see `append_addrs_ct` in the program factory), so a
+    // program compiled for one set of expert weights is only valid for those exact buffers. The
+    // default device-op hash keys solely on tensor specs (shape / dtype / layout / memory-config)
+    // plus the scalar attributes -- all identical from one MoE layer to the next -- so it would
+    // return a stale cached program holding the *previous* layer's (by then possibly freed) weight
+    // addresses, making the matmuls read garbage DRAM (observed as ~1e37 / inf outputs). Fold every
+    // weight buffer address into the hash so a different set of weight tensors misses the program
+    // cache and recompiles with the correct baked-in addresses.
+    std::vector<uint32_t> weight_addresses;
+    weight_addresses.reserve(tensor_args.gate_up_weights.size() + tensor_args.down_weights.size());
+    for (const auto& w : tensor_args.gate_up_weights) {
+        weight_addresses.push_back(static_cast<uint32_t>(w.buffer()->address()));
+    }
+    for (const auto& w : tensor_args.down_weights) {
+        weight_addresses.push_back(static_cast<uint32_t>(w.buffer()->address()));
+    }
+    auto hash = tt::tt_metal::operation::hash_operation<FusedExpertsDeviceOperation>(
+        attributes.num_experts,
+        attributes.intermediate_size,
+        attributes.swiglu_limit,
+        attributes.output_memory_config,
+        tensor_args.input_tensor,
+        tensor_args.routing_weights,
+        tensor_args.gate_up_weights.front(),
+        tensor_args.down_weights.front(),
+        weight_addresses);
+    return hash;
+}
+
 FusedExpertsDeviceOperation::spec_return_value_t FusedExpertsDeviceOperation::compute_output_specs(
     const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
     // The output is the routing-weighted sum of every selected expert's down matmul result:

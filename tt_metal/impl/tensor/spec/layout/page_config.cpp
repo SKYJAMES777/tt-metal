@@ -218,15 +218,7 @@ size_t RowMajorPageConfig::get_page_size_bytes(const Shape2D& page_shape, DataTy
     return size;
 }
 
-const Tile& RowMajorPageConfig::get_tile() const {
-    bool is_trivial = (tile_ == Tile{});
-    log_warning(
-        LogMetal,
-        "Attempting to extract tile information out of a ROW MAJOR layout, this will be rejected in the future. See "
-        "#18536. (trivial tile: {})",
-        is_trivial);
-    return tile_;
-}
+const Tile& RowMajorPageConfig::get_tile() const { return tile_; }
 
 Alignment RowMajorPageConfig::get_required_shard_shape_alignment() const { return Alignment({1}); }
 
