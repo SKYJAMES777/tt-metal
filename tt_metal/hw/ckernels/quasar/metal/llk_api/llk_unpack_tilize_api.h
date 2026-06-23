@@ -91,10 +91,10 @@ inline void llk_unpack_tilize_uninit([[maybe_unused]] const std::uint32_t operan
  * @param  ct_dim           Number of column tiles in the tilize block.
  */
 template <
-    [[maybe_unused]] bool neginf_srcA = false,
-    [[maybe_unused]] std::uint32_t reload_srcB = false,
-    [[maybe_unused]] bool zero_srcA = false,
-    [[maybe_unused]] bool zero_srcA_reduce = false>
+    bool neginf_srcA = false /*unused*/,
+    std::uint32_t reload_srcB = false /*unused*/,
+    bool zero_srcA = false /*unused*/,
+    bool zero_srcA_reduce = false /*unused*/>
 inline void llk_unpack_tilizeA_B_init(
     const std::uint32_t operandA, const std::uint32_t operandB, const std::uint32_t ct_dim) {
     static_assert(!zero_srcA, "zero_srcA = true does not trigger any functionality on Quasar.");
@@ -141,10 +141,10 @@ inline void llk_unpack_tilizeA_B_init(
  * @param  block_ct_dim Number of column tiles in the tilize block.
  */
 template <
-    [[maybe_unused]] bool neginf_srcA = false,
-    [[maybe_unused]] std::uint32_t reload_srcB = false,
-    [[maybe_unused]] bool zero_srcA = false,
-    [[maybe_unused]] bool zero_srcA_reduce = false>
+    bool neginf_srcA = false /*unused*/,
+    std::uint32_t reload_srcB = false /*unused*/,
+    bool zero_srcA = false /*unused*/,
+    bool zero_srcA_reduce = false /*unused*/>
 inline void llk_unpack_tilizeA_B(
     const std::uint32_t operandA,
     const std::uint32_t operandB,
@@ -198,10 +198,10 @@ inline void llk_unpack_tilizeA_B(
  * @param  tile_idx_b      Tile index within operand B.
  */
 template <
-    [[maybe_unused]] bool neginf_srcA = false,
-    [[maybe_unused]] std::uint32_t reload_srcB = false,
-    [[maybe_unused]] bool zero_srcA = false,
-    [[maybe_unused]] bool zero_srcA_reduce = false>
+    bool neginf_srcA = false /*unused*/,
+    std::uint32_t reload_srcB = false /*unused*/,
+    bool zero_srcA = false /*unused*/,
+    bool zero_srcA_reduce = false /*unused*/>
 inline void llk_unpack_tilizeA_B_block(
     const std::uint32_t operandA,
     const std::uint32_t operandB,
