@@ -44,7 +44,7 @@ from models.experimental.deepseek_v4_flash.tt.weight_loader import (
 )
 
 _DEFAULT_MODEL_DIR = "/home/ttuser/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash"
-_DEFAULT_TEXT = "I"
+_DEFAULT_TEXT = "What are the top 10 comedy movies of all time."
 _WEIGHT_DTYPE = ttnn.bfloat4_b
 _CACHE_DIR = os.environ.get("DEEPSEEK_V4_CACHE_DIR", "../cache")
 

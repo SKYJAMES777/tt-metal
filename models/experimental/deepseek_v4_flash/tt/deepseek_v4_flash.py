@@ -33,9 +33,21 @@ try:
 except Exception:  # pragma: no cover - tracy missing on non-profiling builds
     _tracy_signpost = None
 
+# Master switch for the per-module signposts. Defaults on (they are a no-op unless
+# the run is captured under the Tracy profiler), but can be disabled to drop even
+# the host-side call overhead: set ``DEEPSEEK_V4_SIGNPOSTS=0`` or call
+# :func:`set_signposts_enabled(False)` at runtime.
+_SIGNPOSTS_ENABLED = os.environ.get("DEEPSEEK_V4_SIGNPOSTS", "1") not in ("0", "", "false", "False")
+
+
+def set_signposts_enabled(enabled: bool) -> None:
+    """Enable/disable the per-module Tracy signposts at runtime."""
+    global _SIGNPOSTS_ENABLED
+    _SIGNPOSTS_ENABLED = bool(enabled)
+
 
 def _signpost(header: str) -> None:
-    if _tracy_signpost is not None and not _IN_TRACE_CAPTURE:
+    if _SIGNPOSTS_ENABLED and _tracy_signpost is not None and not _IN_TRACE_CAPTURE:
         _tracy_signpost(header=header)
 
 
