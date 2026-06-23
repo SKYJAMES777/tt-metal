@@ -363,8 +363,8 @@ class _StaticLayerCache:
         runs over the whole buffer and the block-bias mask drops the windows past
         the current position. ``None`` for sliding-only layers.
 
-    Built (and seeded from the eager prefill caches) by
-    :meth:`DeepSeekV4Model.prepare_static_decode`.
+    Built empty (all-zero) by :meth:`DeepSeekV4Model.prepare_static_decode`; the
+    prompt is written in by replaying :meth:`decode_traced` per prompt token.
     """
 
     __slots__ = ("sliding", "compressor_kv", "compressor_gate")
@@ -2350,7 +2350,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
         ]
 
     def reset_caches(self) -> None:
-        """Drop all per-layer decode state (call before a fresh prefill)."""
+        """Drop all per-layer decode state (call before decoding a fresh sequence)."""
         self.kv_caches = self._new_caches()
 
     # -- per-layer RoPE tables / masks ------------------------------------------ #
@@ -2358,43 +2358,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
         _profile(device)
 
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-
-    def _rope_tables(
-        self, rope: dict, layer_type: str, compress_rate: Optional[int], cache: dict, device: ttnn.MeshDevice
-    ):
-        key = f'{"sliding" if layer_type == "sliding_attention" else compress_rate}_{device.id()}'
-        if key in cache:
-            return cache[key]
-        cos, sin = rope["main"] if layer_type == "sliding_attention" else rope["compress"]
-        cos_full, sin_full = make_rope_table(cos, sin)
-        cos_tt = self._to_tt(cos_full, device)
-        sin_tt = self._to_tt(sin_full, device)
-        neg_sin_tt = self._to_tt(-sin_full, device)
-        cos_win_tt = sin_win_tt = None
-        if layer_type != "sliding_attention":
-            cw, sw = rope["win"][compress_rate]
-            cw, sw = make_rope_table(cw, sw)
-            cos_win_tt = self._to_tt(cw, device)
-            sin_win_tt = self._to_tt(sw, device)
-        out = (cos_tt, sin_tt, neg_sin_tt, cos_win_tt, sin_win_tt)
-        cache[key] = out
-        return out
-
-    def _mask(
-        self, seq_len: int, layer_type: str, compress_rate: Optional[int], cache: dict, device: ttnn.MeshDevice
-    ) -> ttnn.Tensor:
-        key = f'{"sliding" if layer_type == "sliding_attention" else compress_rate}_{device.id()}'
-        if key in cache:
-            return cache[key]
-        sliding = _sliding_causal_mask(seq_len, self.config.sliding_window)
-        if layer_type == "sliding_attention":
-            mask = sliding
-        else:
-            n_win = seq_len // compress_rate
-            mask = torch.cat([sliding, _block_bias(seq_len, n_win, compress_rate)], dim=-1)
-        mask_tt = self._to_tt(mask, device)
-        cache[key] = mask_tt
-        return mask_tt
 
     def _rope_rows_decode(
         self, rope: dict, pos: int, layer_type: str, compress_rate: Optional[int], cache: dict, device: ttnn.MeshDevice
@@ -2449,77 +2412,13 @@ class DeepSeekV4Model(DeepSeekV4Module):
             streams.deallocate(True)  # the persistent traced buffer must survive
         return output_tensor
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        rope: dict,
-        populate_cache: bool = False,
-        cache_len: Optional[int] = None,
-    ) -> ttnn.Tensor:
-        """``input_ids`` torch ``[B, S]`` + host ``rope`` bundle -> ``[B, S, hidden]``.
-
-        ``populate_cache`` runs this prefill as the seed for a subsequent
-        :meth:`decode`: each layer fills its :class:`_LayerKVCache` from the first
-        ``cache_len`` (real, non-padding) tokens. Call :meth:`reset_caches` first.
-        """
-        seq_len = input_ids.shape[1]
-        ids_tt = ttnn.from_torch(
-            input_ids.to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.first_device
-        )
-        inputs_embeds = self.embed_tokens(ids_tt)  # [B, S, D]
-        b, s, d = inputs_embeds.shape
-        streams = ttnn.reshape(inputs_embeds, [b, s, 1, d])
-        streams = ttnn.repeat(streams, ttnn.Shape([1, 1, self.config.hc_mult, 1]))  # [B, S, hc_mult, D]
-
-        rope_cache: dict = {}
-        mask_cache: dict = {}
-        last_submesh_id = 0
-        for li, layer in enumerate(self.layers):
-            if self.use_submeshes:
-                current_submesh_id = li // self.layers_per_device
-                if current_submesh_id != last_submesh_id:
-                    logger.info(
-                        f"Copying hidden states from submesh {last_submesh_id} to submesh {current_submesh_id} for layer {li}"
-                    )
-                    streams = self._copy_streams_between_submeshes(streams, last_submesh_id, current_submesh_id)
-                this_device = self.submeshes[current_submesh_id]
-            else:
-                this_device = self.first_device
-            layer_type = self.config.layer_types[li]
-            compress_rate = None if layer_type == "sliding_attention" else self.config.compress_rates[layer_type]
-            cos_tt, sin_tt, neg_sin_tt, cos_win_tt, sin_win_tt = self._rope_tables(
-                rope, layer_type, compress_rate, rope_cache, this_device
-            )
-            mask_tt = self._mask(seq_len, layer_type, compress_rate, mask_cache, this_device)
-            streams = layer.forward(
-                streams,
-                cos_tt,
-                sin_tt,
-                neg_sin_tt,
-                mask_tt,
-                cos_win=cos_win_tt,
-                sin_win=sin_win_tt,
-                input_ids=input_ids,
-                kv_cache=self.kv_caches[li] if populate_cache else None,
-                cache_len=cache_len,
-            )
-            last_submesh_id = current_submesh_id
-            _profile(this_device)
-        return self.norm(self.hc_head(streams))
-
-    def prefill(self, input_ids: torch.Tensor, rope: dict, cache_len: Optional[int] = None) -> ttnn.Tensor:
-        """Prefill that seeds the decode KV cache. ``input_ids`` ``[B, S]`` (tile-padded);
-        ``cache_len`` is the real token count (defaults to ``S``)."""
-        self.reset_caches()
-        return self.forward(input_ids, rope, populate_cache=True, cache_len=cache_len)
-
     def decode(self, token_id: int, pos: int, rope: dict) -> ttnn.Tensor:
         """Generate one step: feed ``token_id`` at absolute position ``pos`` against
         the running KV cache; returns ``[B, 1, hidden]`` (apply ``lm_head`` for logits).
 
         ``rope`` is the *full* (max-length) host bundle; the needed rows are sliced
-        per layer. Requires a prior :meth:`prefill` (the cache holds positions
-        ``0 .. pos - 1``)."""
+        per layer. The prompt is prefilled by calling this once per prompt token at
+        ascending positions, so the cache holds positions ``0 .. pos - 1``."""
         ids = torch.tensor([[token_id]], dtype=torch.long)
         ids_tt = ttnn.from_torch(
             ids.to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.first_device
@@ -2600,20 +2499,22 @@ class DeepSeekV4Model(DeepSeekV4Module):
             row = torch.cat([sld, win], dim=0)
         return ttnn.from_torch(row.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-    def _build_static_layer_cache(self, li: int, device: ttnn.MeshDevice, real_len: int) -> "_StaticLayerCache":
-        """Seed a layer's fixed-size in-place caches from the eager prefill caches
-        (``self.kv_caches[li]``, populated by :meth:`prefill`)."""
-        kvc = self.kv_caches[li]
+    def _build_static_layer_cache(self, li: int, device: ttnn.MeshDevice) -> "_StaticLayerCache":
+        """Allocate a layer's fixed-size in-place caches *empty* (all-zero).
+
+        There is no prefill: the prompt is fed one token at a time through
+        :meth:`decode_traced`, which writes each token's K=V / compressor
+        projection into these buffers in place at its absolute position. Unwritten
+        ring slots / windows stay zero and are dropped by the per-step decode mask.
+        """
         dh = self.config.head_dim
         w = self.sliding_window
-        # Sliding ring buffer: place each kept rotated K=V at slot ``abs_pos % W``.
-        sld = ttnn.to_torch(kvc.sliding.kv).to(torch.float32)  # [1, 1, L, Dh]
-        length = sld.shape[2]
-        host_sld = torch.zeros(1, 1, w, dh)
-        for i in range(length):
-            host_sld[0, 0, (real_len - length + i) % w] = sld[0, 0, i]
         sliding = ttnn.from_torch(
-            host_sld, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            torch.zeros(1, 1, w, dh),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ckv = cgate = None
         layer_type = self.config.layer_types[li]
@@ -2621,26 +2522,28 @@ class DeepSeekV4Model(DeepSeekV4Module):
             cr = self.config.compress_rates[layer_type]
             cap = self._cr_caps[cr][0]
             feat = (2 if layer_type == "compressed_sparse_attention" else 1) * dh
-            ck = ttnn.to_torch(kvc.compressor.kv).to(torch.float32)  # [1, real_len, feat]
-            cg = ttnn.to_torch(kvc.compressor.gate).to(torch.float32)
-            n = min(cap, ck.shape[1])
-            hk = torch.zeros(1, 1, cap, feat)
-            hg = torch.zeros(1, 1, cap, feat)
-            hk[0, 0, :n] = ck[0, :n]
-            hg[0, 0, :n] = cg[0, :n]
             ckv = ttnn.from_torch(
-                hk, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                torch.zeros(1, 1, cap, feat),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
             cgate = ttnn.from_torch(
-                hg, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                torch.zeros(1, 1, cap, feat),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
         return _StaticLayerCache(sliding, ckv, cgate)
 
-    def prepare_static_decode(self, rope: dict, max_seq: int, real_len: int, lm_head=None) -> None:
-        """Allocate + seed the traced-decode state after a :meth:`prefill`.
+    def prepare_static_decode(self, rope: dict, max_seq: int, lm_head=None) -> None:
+        """Allocate the traced-decode state (the prompt is prefilled by replaying
+        :meth:`decode_traced` once per prompt token into these empty caches).
 
-        Builds, per submesh: the fixed-size in-place caches (seeded from the eager
-        prefill caches), the persistent per-step input tensors (token id / streams,
+        Builds, per submesh: the fixed-size in-place caches (empty / all-zero),
+        the persistent per-step input tensors (token id / streams,
         RoPE rows, masks, cache positions, hash masks) and the constant window-RoPE
         tables. ``max_seq`` must be a multiple of every compress-rate (the caller
         pads it) so each compressor's fixed capacity tiles cleanly into windows.
@@ -2684,7 +2587,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 "mask_in": {},
                 "win_rope": {},
                 "hash_masks": {},
-                "scaches": {li: self._build_static_layer_cache(li, device, real_len) for li in layers_k},
+                "scaches": {li: self._build_static_layer_cache(li, device) for li in layers_k},
                 "tid": None,
                 "output": None,
             }
@@ -2811,7 +2714,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
     def decode_traced(self, token_id: int, pos: int) -> ttnn.Tensor:
         """One traced decode step: feed ``token_id`` at absolute position ``pos``.
 
-        Requires a prior :meth:`prefill` + :meth:`prepare_static_decode`. Captures
+        Requires a prior :meth:`prepare_static_decode`. Captures
         the per-submesh traces lazily on the first call, then (every call) refreshes
         the per-step inputs, replays each submesh's trace in order, and socket-copies
         the residual streams between submeshes (device-to-device, no host hop).
