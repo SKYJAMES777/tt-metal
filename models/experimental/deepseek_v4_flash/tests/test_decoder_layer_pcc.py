@@ -28,11 +28,11 @@ The routed experts live on device in bf16 (one layer fits the Blackhole DRAM),
 so the only precision gap vs the fp32 reference is bf16 device arithmetic.
 
 ``test_decoder_layer_decode_pcc`` reuses the same reference bundle to exercise
-the **decode** path (``DeepSeekV4DecoderLayer.decode``, ``T == 1``), whose routed
-MoE runs the single-op ``fused_experts`` kernel: it seeds the layer's KV /
-compressor cache with a tile-aligned prefix, then decodes the next few tokens one
-step at a time and PCC-compares each against the reference's full-prefill row at
-the same position (decode is the per-token-equivalent of a full prefill).
+the **decode** path (``DeepSeekV4DecoderLayer.decode``, ``T == 1``): it seeds the
+layer's KV / compressor cache with a tile-aligned prefix, then decodes the next
+few tokens one step at a time and PCC-compares each against the reference's
+full-prefill row at the same position (decode is the per-token-equivalent of a
+full prefill).
 
 Set ``DEEPSEEK_V4_CACHE_DIR=<dir>`` to skip the slow weight loading on reruns:
 the converted ttnn weight tiles are dumped/reused (the 256-expert dequant is
@@ -251,10 +251,9 @@ _MASK_NEG = -1.0e9
 PCC_THRESHOLD = 0.98
 # Decode reuses the *prefill* HF reference: a single-token decode step is the
 # bit-for-bit-equivalent of a full prefill over the same tokens-so-far, so the
-# decoded row at position p must match the reference's full-prefill row p. The
-# decode MoE additionally routes through the single-op ``fused_experts`` kernel
-# (T == 1 on H == 4096), whose bf8 activations widen the gap a touch vs the
-# prefill matmul loop, hence the slightly looser threshold.
+# decoded row at position p must match the reference's full-prefill row p. Decode
+# reads the incrementally-built KV / compressor cache (vs full-prefill attention),
+# which widens the gap a touch, hence the slightly looser threshold.
 DECODE_PCC_THRESHOLD = 0.97
 # How many tokens to decode (one device step each) past the seeded prefix.
 _DECODE_STEPS = 4

@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import ttnn
@@ -7,6 +8,31 @@ import torch
 from .quant import dequantize_weight
 from .weight_loader import DeepseekV4WeightLoader
 from loguru import logger
+
+
+# ``ttnn.ReadDeviceProfiler`` is a host call that syncs the device; it must never
+# run inside a ``ttnn`` trace capture (which records device ops only and forbids
+# host round-trips / syncs mid-capture). The traced decode path reuses several of
+# the eager ``forward`` helpers below, so route every profiler read through this
+# guard and silence it while a trace is being captured.
+_IN_TRACE_CAPTURE = False
+
+
+def _profile(device) -> None:
+    if not _IN_TRACE_CAPTURE:
+        ttnn.ReadDeviceProfiler(device)
+
+
+@contextmanager
+def _trace_capture_guard():
+    """Silence :func:`_profile` for the duration of a trace capture."""
+    global _IN_TRACE_CAPTURE
+    prev = _IN_TRACE_CAPTURE
+    _IN_TRACE_CAPTURE = True
+    try:
+        yield
+    finally:
+        _IN_TRACE_CAPTURE = prev
 
 
 class _CachePath(str):
@@ -284,6 +310,35 @@ class _LayerKVCache:
         self.compressor = _CompressorCache() if has_compressor else None
 
 
+class _StaticLayerCache:
+    """Fixed-size, in-place per-layer decode caches for the *traced* decode path.
+
+    Unlike :class:`_LayerKVCache` (which grows via ``concat`` each step), these are
+    DRAM tensors of a fixed capacity written in place at the new token's position
+    by ``paged_update_cache`` (a device-tensor index), so the captured trace's
+    shapes / addresses are step-invariant:
+
+      * ``sliding`` ``[1, 1, window, Dh]`` -- a ring buffer (slot ``pos % window``);
+        attention masks unwritten / out-of-window slots.
+      * ``compressor_kv`` / ``compressor_gate`` ``[1, 1, cap, feat]`` -- every
+        source token's compressor projection at its absolute position; the pool
+        runs over the whole buffer and the block-bias mask drops the windows past
+        the current position. ``None`` for sliding-only layers.
+
+    Built (and seeded from the eager prefill caches) by
+    :meth:`DeepSeekV4Model.prepare_static_decode`.
+    """
+
+    __slots__ = ("sliding", "compressor_kv", "compressor_gate")
+
+    def __init__(
+        self, sliding: ttnn.Tensor, compressor_kv: Optional[ttnn.Tensor], compressor_gate: Optional[ttnn.Tensor]
+    ):
+        self.sliding = sliding
+        self.compressor_kv = compressor_kv
+        self.compressor_gate = compressor_gate
+
+
 def _store_compressor_projections(
     cache: "_CompressorCache",
     kv: ttnn.Tensor,
@@ -397,6 +452,38 @@ def _apply_rope(x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor, rot: ttnn.Te
     if nope is None:
         return rotated
     return ttnn.concat([nope, rotated], dim=-1)
+
+
+# ---------------------------------------------------------------------------- #
+# Traced-decode helpers (fixed-size, in-place KV cache via ``paged_update_cache``)
+#
+# A reusable ``ttnn`` trace requires fixed tensor shapes / addresses and no host
+# round-trips inside the captured region, so the traced decode swaps the eager
+# concat-grown caches for fixed-size DRAM buffers that are written *in place*
+# every step at the new token's position (a device-tensor index, so the same
+# trace serves every step). ``paged_update_cache`` is the canonical trace-safe
+# in-place KV writer (it mutates the persistent cache buffer during capture,
+# unlike ``ttnn.copy`` which is rejected mid-capture).
+# ---------------------------------------------------------------------------- #
+def _height_sharded_l1_config(width: int) -> ttnn.MemoryConfig:
+    """Single-core height-sharded L1 config for a ``[1, 1, 1, width]`` decode row.
+
+    ``paged_update_cache`` requires its (single-token) input to be height-sharded
+    with one core per batch user (B == 1 here -> one core), shard width == the
+    last dim, ROW_MAJOR orientation.
+    """
+    grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+    shard_spec = ttnn.ShardSpec(grid, [ttnn.TILE_SIZE, width], ttnn.ShardOrientation.ROW_MAJOR)
+    return ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
+
+
+def _update_cache_at(cache: ttnn.Tensor, row: ttnn.Tensor, pos_tensor: ttnn.Tensor) -> None:
+    """In-place write ``row`` ``[1, 1, 1, F]`` into ``cache`` ``[1, 1, L, F]`` at the
+    sequence index held (on device) by ``pos_tensor`` ``[1]`` (INT32). Trace-safe."""
+    width = row.shape[-1]
+    row_sharded = ttnn.interleaved_to_sharded(row, _height_sharded_l1_config(width))
+    ttnn.experimental.paged_update_cache(cache, row_sharded, update_idxs_tensor=pos_tensor)
+    ttnn.deallocate(row_sharded)
 
 
 class DeepSeekV4Embedding(DeepSeekV4Module):
@@ -581,6 +668,33 @@ class DeepSeekV4HCACompressor:
         kv_all, gate_all = cache.append(kv, gate)
         return self._pool(kv_all, gate_all, cos_win, sin_win)
 
+    def decode_static(
+        self,
+        hidden: ttnn.Tensor,
+        cos_win: ttnn.Tensor,
+        sin_win: ttnn.Tensor,
+        kv_cache: ttnn.Tensor,
+        gate_cache: ttnn.Tensor,
+        pos_tensor: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """Trace-safe decode: write this token's projection in place at ``pos_tensor``
+        into the fixed ``[1, 1, cap, Dh]`` caches, then pool over the *whole* buffer.
+
+        ``cos_win`` / ``sin_win`` cover every window of the fixed capacity
+        (``cap // compress_rate`` rows); windows past the current position are
+        pooled from zero-filled (unwritten) projections and dropped by the caller's
+        additive block-bias mask.
+        """
+        kv, gate = self._project(hidden)  # [1, 1, Dh]
+        kv = ttnn.reshape(kv, [1, 1, 1, self.head_dim])
+        gate = ttnn.reshape(gate, [1, 1, 1, self.head_dim])
+        _update_cache_at(kv_cache, kv, pos_tensor)
+        _update_cache_at(gate_cache, gate, pos_tensor)
+        cap = kv_cache.shape[2]
+        kv_all = ttnn.reshape(kv_cache, [1, cap, self.head_dim])
+        gate_all = ttnn.reshape(gate_cache, [1, cap, self.head_dim])
+        return self._pool(kv_all, gate_all, cos_win, sin_win)
+
 
 class DeepSeekV4CSACompressor:
     """Compressed-Sparse-Attention compressor, stateless prefill mode.
@@ -631,6 +745,21 @@ class DeepSeekV4CSACompressor:
             device,
             cache_file_name=cache.file("compressor.position_bias"),
         )
+        # Persistent window-0 Ca filler (zero kv / ``-inf`` gate, softmax weight 0).
+        # ``_pool`` re-uploaded these from host on every call -- a host transfer
+        # that is illegal inside a trace -- so keep them resident (B == 1).
+        self._zeros_filler = ttnn.from_torch(
+            torch.zeros(1, 1, self.compress_rate, self.head_dim),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self._neg_filler = ttnn.from_torch(
+            torch.full((1, 1, self.compress_rate, self.head_dim), _MASK_NEG),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
     def _project(self, hidden: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         """``hidden`` ``[B, S, D]`` -> per-token ``(kv, gate)`` ``[B, S, 2*Dh]`` each."""
@@ -658,16 +787,13 @@ class DeepSeekV4CSACompressor:
 
         ca, cb = ttnn.split(kv, dh, dim=3)
         ca_g, cb_g = ttnn.split(gate, dh, dim=3)
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         # Shift Ca down one window: entry w sees window w-1's Ca; entry 0 sees a
-        # zero-kv / -inf-gate filler (softmax weight 0).
-        zeros = ttnn.from_torch(
-            torch.zeros(b, 1, cr, dh), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
-        )
-        neg = ttnn.from_torch(
-            torch.full((b, 1, cr, dh), _MASK_NEG), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
-        )
+        # zero-kv / -inf-gate filler (softmax weight 0). Fillers are resident
+        # (B == 1) so the pool stays trace-safe (no per-call host transfer).
+        zeros = self._zeros_filler
+        neg = self._neg_filler
         ca_prev_src = ttnn.slice(ca, [0, 0, 0, 0], [b, n_win - 1, cr, dh])
         cag_prev_src = ttnn.slice(ca_g, [0, 0, 0, 0], [b, n_win - 1, cr, dh])
         ca_prev = ttnn.concat([zeros, ca_prev_src], dim=1)
@@ -698,6 +824,29 @@ class DeepSeekV4CSACompressor:
     ) -> ttnn.Tensor | None:
         kv, gate = self._project(hidden)
         kv_all, gate_all = cache.append(kv, gate)
+        return self._pool(kv_all, gate_all, cos_win, sin_win)
+
+    def decode_static(
+        self,
+        hidden: ttnn.Tensor,
+        cos_win: ttnn.Tensor,
+        sin_win: ttnn.Tensor,
+        kv_cache: ttnn.Tensor,
+        gate_cache: ttnn.Tensor,
+        pos_tensor: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """Trace-safe decode: write this token's ``2*Dh`` projection in place at
+        ``pos_tensor`` into the fixed ``[1, 1, cap, 2*Dh]`` caches, then pool the
+        whole buffer (Ca/Cb overlap). See :meth:`DeepSeekV4HCACompressor.decode_static`."""
+        feat = 2 * self.head_dim
+        kv, gate = self._project(hidden)  # [1, 1, 2*Dh]
+        kv = ttnn.reshape(kv, [1, 1, 1, feat])
+        gate = ttnn.reshape(gate, [1, 1, 1, feat])
+        _update_cache_at(kv_cache, kv, pos_tensor)
+        _update_cache_at(gate_cache, gate, pos_tensor)
+        cap = kv_cache.shape[2]
+        kv_all = ttnn.reshape(kv_cache, [1, cap, feat])
+        gate_all = ttnn.reshape(gate_cache, [1, cap, feat])
         return self._pool(kv_all, gate_all, cos_win, sin_win)
 
 
@@ -762,6 +911,11 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         sinks = weights["sinks"]
         sinks = sinks() if callable(sinks) else sinks
         self.sinks_torch = sinks.reshape(1, self.num_heads, 1, 1).float()
+        # Persistent device copy of the (decode) sinks ``[1, H, 1, 1]`` (b == s == 1):
+        # the eager ``_attention`` re-uploads the sinks from host each call, a host
+        # transfer that is illegal inside a trace, so the traced decode path passes
+        # this pre-uploaded tensor instead.
+        self.sinks_tt = ttnn.from_torch(self.sinks_torch, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         # The rotate-half matrix must stay precise (a bf4 rotation would corrupt RoPE).
         self.rot = _load_weight(_interleaved_rotate_matrix(self.rope_dim), device, cache_file_name=cache.file("rot"))
@@ -773,13 +927,19 @@ class DeepSeekV4Attention(DeepSeekV4Module):
             else None
         )
 
-    def _attention(self, q: ttnn.Tensor, kv: ttnn.Tensor, mask: ttnn.Tensor) -> ttnn.Tensor:
+    def _attention(
+        self, q: ttnn.Tensor, kv: ttnn.Tensor, mask: ttnn.Tensor, sinks: ttnn.Tensor | None = None
+    ) -> ttnn.Tensor:
         """Eager attention with per-head learnable sinks (gpt-oss style).
 
         ``q`` is ``[B, H, S, Dh]``; ``kv`` (shared K=V) is ``[B, 1, Skv, Dh]``.
         The sink is an extra per-head logit column folded into the softmax
         denominator and then dropped — equivalently a rescale of the standard
         softmax by ``1 / (1 + exp(sink - m) / Σ)``.
+
+        ``sinks`` may be a pre-uploaded ``[B, H, S, 1]`` device tensor (the traced
+        decode path passes :attr:`sinks_tt` to avoid a host transfer); when ``None``
+        the sinks are uploaded from host (the eager path).
         """
         b, h, s, _ = q.shape
         skv = kv.shape[2]
@@ -787,14 +947,15 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=_HIFI4)  # [B, H, S, Skv]
         scores = ttnn.multiply(scores, self.scaling)
         scores = ttnn.add(scores, mask)
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
-        sinks = ttnn.from_torch(
-            self.sinks_torch.expand(b, h, s, 1).contiguous(),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-        )
+        if sinks is None:
+            sinks = ttnn.from_torch(
+                self.sinks_torch.expand(b, h, s, 1).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+            )
         row_max = ttnn.max(scores, dim=-1, keepdim=True)  # [B, H, S, 1]
         m = ttnn.maximum(row_max, sinks)
         exp_scores = ttnn.exp(ttnn.subtract(scores, m))
@@ -826,7 +987,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         """
         b, s, _ = hidden.shape
         h, dh = self.num_heads, self.head_dim
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden))  # [B, S, q_lora_rank]
         q = self.q_b_proj(q_residual)  # [B, S, H*Dh]
@@ -925,13 +1086,51 @@ class DeepSeekV4Attention(DeepSeekV4Module):
             compressed = self.compressor.decode(hidden, cos_win, sin_win, kv_cache.compressor)
             if compressed is not None:
                 kv = ttnn.concat([kv, compressed], dim=2)  # [B, 1, L_sld + n_win, Dh]
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         mask = ttnn.zeros([1, 1, s, kv.shape[2]], ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device)
         attn = self._attention(q, kv, mask)  # [B, H, 1, Dh]
 
         attn = _apply_rope(attn, cos, neg_sin, self.rot, self.rope_dim)
         attn = ttnn.transpose(attn, 1, 2)  # [B, 1, H, Dh]
+        return self._grouped_output(attn)
+
+    def decode_static(
+        self,
+        hidden: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+        neg_sin: ttnn.Tensor,
+        cos_win: ttnn.Tensor | None,
+        sin_win: ttnn.Tensor | None,
+        mask: ttnn.Tensor,
+        scache: "_StaticLayerCache",
+        sliding_pos: ttnn.Tensor,
+        compress_pos: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """Trace-safe single-token decode against fixed-size in-place caches.
+
+        Writes the new token's rotated K=V into the ``sliding_window``-sized ring
+        buffer (slot = ``pos % window`` carried by ``sliding_pos``) and, for
+        CSA/HCA layers, its compressor projections at absolute ``compress_pos``;
+        attends the *whole* fixed cache (sliding slots ++ all compressor windows)
+        under the supplied additive ``mask`` (zeros for valid slots / windows,
+        ``_MASK_NEG`` for unwritten slots and not-yet-emittable windows). Equivalent
+        to :meth:`decode` but with static shapes / addresses for a reusable trace.
+        """
+        q, kv_new = self._qkv(hidden, cos, sin)  # q [1,H,1,Dh], kv_new [1,1,1,Dh]
+        _update_cache_at(scache.sliding, kv_new, sliding_pos)
+        kv = scache.sliding  # [1, 1, window, Dh] (updated in place)
+
+        if self.compressor is not None:
+            compressed = self.compressor.decode_static(
+                hidden, cos_win, sin_win, scache.compressor_kv, scache.compressor_gate, compress_pos
+            )
+            kv = ttnn.concat([kv, compressed], dim=2)  # [1, 1, window + n_win, Dh]
+
+        attn = self._attention(q, kv, mask, sinks=self.sinks_tt)  # [1, H, 1, Dh]
+        attn = _apply_rope(attn, cos, neg_sin, self.rot, self.rope_dim)
+        attn = ttnn.transpose(attn, 1, 2)  # [1, 1, H, Dh]
         return self._grouped_output(attn)
 
 
@@ -1023,7 +1222,7 @@ class DeepSeekV4TopKRouter(DeepSeekV4Module):
         logits = self.gate(x_flat)  # [1, 1, T, E]
         scores = ttnn.sqrt(ttnn.softplus(logits))
         biased = ttnn.add(scores, self.e_score_correction_bias)
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         # Top-k selection -> one-hot mask. Scatter (rather than a >= threshold
         # compare) selects exactly k experts even if two scores collide under
@@ -1079,7 +1278,7 @@ class DeepSeekV4HashRouter(DeepSeekV4Module):
         logits = self.gate(x_flat)  # [1, 1, T, E]
         scores = ttnn.sqrt(ttnn.softplus(logits))
         t = x_flat.shape[2]
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         # Static per-token expert selection -> host one-hot mask [1,1,T,E].
         eids = self.tid2eid[input_ids.reshape(-1).long()]  # [T, top_k]
@@ -1089,6 +1288,25 @@ class DeepSeekV4HashRouter(DeepSeekV4Module):
             mask.reshape(1, 1, t, self.num_experts), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
         )
 
+        selected = ttnn.multiply(scores, mask_tt)
+        denom = ttnn.add(ttnn.sum(selected, dim=-1, keepdim=True), 1.0e-20)
+        return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
+
+    def selection_mask(self, token_id: int) -> torch.Tensor:
+        """Host one-hot expert-selection mask ``[1, 1, 1, E]`` for ``token_id`` —
+        the frozen ``tid2eid`` lookup, built on host (the traced decode writes it
+        into a persistent device input each step)."""
+        eids = self.tid2eid[int(token_id)].reshape(-1).long()
+        mask = torch.zeros(self.num_experts, dtype=torch.float32)
+        mask.scatter_(0, eids, 1.0)
+        return mask.reshape(1, 1, 1, self.num_experts)
+
+    def forward_static(self, x_flat: ttnn.Tensor, mask_tt: ttnn.Tensor) -> ttnn.Tensor:
+        """Trace-safe hash routing: ``mask_tt`` ``[1,1,1,E]`` is the (persistent,
+        per-step) device selection mask from :meth:`selection_mask`; the gate score
+        path stays on device. Returns dense routing weights ``[1,1,1,E]``."""
+        logits = self.gate(x_flat)
+        scores = ttnn.sqrt(ttnn.softplus(logits))
         selected = ttnn.multiply(scores, mask_tt)
         denom = ttnn.add(ttnn.sum(selected, dim=-1, keepdim=True), 1.0e-20)
         return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
@@ -1201,6 +1419,7 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
     ):
         self.device = device
         self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
         self.intermediate = config.moe_intermediate_size
         self.hidden = config.hidden_size
         self.limit = config.swiglu_limit
@@ -1269,7 +1488,7 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
             intermediate_size=self.intermediate,
             swiglu_limit=self.limit,
         )  # [1, 1, H]
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
         return ttnn.reshape(out, [1, 1, 1, self.hidden])
 
     def forward(self, x_flat: ttnn.Tensor, routing_weights: ttnn.Tensor) -> ttnn.Tensor:
@@ -1283,7 +1502,7 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         # Read the (small) routing weights to host once: each token's op picks its
         # own hit experts from its row, so no device-side gather is needed here.
         rw_host = ttnn.to_torch(routing_weights).reshape(t, self.num_experts).float()
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         if t == 1:
             return self._decode_token(x_flat, rw_host[0])
@@ -1293,6 +1512,27 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
             for ti in range(t)
         ]
         return ttnn.concat(outs, dim=2)  # [1, 1, T, H]
+
+    def decode_static(self, x_tok: ttnn.Tensor, routing_weights: ttnn.Tensor) -> ttnn.Tensor:
+        """Trace-safe single-token routed FFN. ``x_tok`` ``[1,1,1,H]`` and
+        ``routing_weights`` ``[1,1,1,E]`` (a device tensor); returns ``[1,1,1,H]``.
+
+        Unlike :meth:`forward`, the active experts are *not* read back to host:
+        ``fused_experts`` finds the non-zero experts from the routing row on device
+        and ``num_experts`` is fixed to ``num_experts_per_tok`` (the router always
+        selects exactly ``top_k``), so the op's program — and hence the trace — is
+        invariant across steps.
+        """
+        out = ttnn.experimental.deepseek.moe.fused_experts(
+            x_tok,
+            routing_weights=routing_weights,
+            gate_up_weights=self._gate_up_fused,
+            down_weights=self._down_fused,
+            num_experts=self.top_k,
+            intermediate_size=self.intermediate,
+            swiglu_limit=self.limit,
+        )  # [1, 1, H]
+        return ttnn.reshape(out, [1, 1, 1, self.hidden])
 
 
 class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
@@ -1328,22 +1568,41 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         only for hash-routed layers (frozen ``tid2eid`` selection)."""
         b, s, h = hidden.shape
         x_flat = ttnn.reshape(hidden, [1, 1, b * s, h])
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         if self.is_hash:
             routing_weights = self.gate(x_flat, input_ids)  # [1, 1, T, E]
         else:
             routing_weights = self.gate(x_flat)  # [1, 1, T, E]
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         routed = self.experts(x_flat, routing_weights)  # [1, 1, T, H]
         routed = ttnn.reshape(routed, [b, s, h])
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         shared = self.shared_experts(hidden)  # [B, S, H]
 
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
+        return ttnn.add(routed, shared)
+
+    def decode_static(self, hidden: ttnn.Tensor, hash_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
+        """Trace-safe single-token MoE. ``hidden`` ``[1, 1, H]`` -> ``[1, 1, H]``.
+
+        Routing stays entirely on device: the learned top-k router is already
+        host-sync-free, and hash layers consume the persistent ``hash_mask``
+        ``[1,1,1,E]`` device input (see :meth:`DeepSeekV4HashRouter.forward_static`).
+        The routed FFN runs through the no-host-readback fused-experts decode path.
+        """
+        h = hidden.shape[-1]
+        x_flat = ttnn.reshape(hidden, [1, 1, 1, h])
+        if self.is_hash:
+            routing_weights = self.gate.forward_static(x_flat, hash_mask)
+        else:
+            routing_weights = self.gate(x_flat)
+        routed = self.experts.decode_static(x_flat, routing_weights)  # [1, 1, 1, H]
+        routed = ttnn.reshape(routed, [1, 1, h])
+        shared = self.shared_experts(hidden)
         return ttnn.add(routed, shared)
 
 
@@ -1422,7 +1681,7 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
         pre_w = self.fn_pre(flat)  # [1,1,T,H]
         post_w = self.fn_post(flat)  # [1,1,T,H]
         comb_w = self.fn_comb(flat)  # [1,1,T,H*H]
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         # pre = sigmoid(w*scale + b) + eps ; post = 2*sigmoid(w*scale + b).
         pre = ttnn.add(ttnn.sigmoid(ttnn.add(ttnn.multiply(pre_w, self.pre_scale), self.pre_b)), self.eps)
@@ -1581,7 +1840,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         self.ffn_hc = DeepSeekV4HyperConnection(
             config, _strip_prefix(weights, "ffn_hc"), device, cache=cache.sub("ffn_hc")
         )
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
     def _mix(
         self, post: ttnn.Tensor, comb: ttnn.Tensor, sublayer_out: ttnn.Tensor, streams: ttnn.Tensor
@@ -1593,7 +1852,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         """
         b, s, hc, d = streams.shape
         t = b * s
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         # placement = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2) -> [1,T,H,D].
         out = ttnn.reshape(sublayer_out, [1, t, 1, d])
@@ -1641,7 +1900,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
 
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
 
         return self._mix(post, comb, mlp_out, hidden_streams)
 
@@ -1665,9 +1924,44 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         post, comb, collapsed = self.attn_hc(hidden_streams)
         attn_out = self.self_attn.decode(self.input_layernorm(collapsed), cos, sin, neg_sin, cos_win, sin_win, kv_cache)
         hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
-        ttnn.ReadDeviceProfiler(self.device)
+        _profile(self.device)
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        return self._mix(post, comb, mlp_out, hidden_streams)
+
+    def decode_static(
+        self,
+        hidden_streams: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+        neg_sin: ttnn.Tensor,
+        cos_win: ttnn.Tensor | None,
+        sin_win: ttnn.Tensor | None,
+        mask: ttnn.Tensor,
+        scache: "_StaticLayerCache",
+        sliding_pos: ttnn.Tensor,
+        compress_pos: ttnn.Tensor,
+        hash_mask: ttnn.Tensor | None = None,
+    ) -> ttnn.Tensor:
+        """Trace-safe single-token decode (see :meth:`decode`). Uses the fixed-size
+        in-place attention cache + the host-sync-free MoE so the whole block can be
+        captured into a reusable ``ttnn`` trace."""
+        post, comb, collapsed = self.attn_hc(hidden_streams)
+        attn_out = self.self_attn.decode_static(
+            self.input_layernorm(collapsed),
+            cos,
+            sin,
+            neg_sin,
+            cos_win,
+            sin_win,
+            mask,
+            scache,
+            sliding_pos,
+            compress_pos,
+        )
+        hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
+        post, comb, collapsed = self.ffn_hc(hidden_streams)
+        mlp_out = self.mlp.decode_static(self.post_attention_layernorm(collapsed), hash_mask=hash_mask)
         return self._mix(post, comb, mlp_out, hidden_streams)
 
 
@@ -1854,7 +2148,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     weight_dtype=weight_dtype,
                 )
             )
-            ttnn.ReadDeviceProfiler(current_device)
+            _profile(current_device)
 
         # The head (hc_head / norm / external lm_head) must live where the *last*
         # decoder layer's output lands, not unconditionally on the final submesh —
@@ -1959,7 +2253,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
 
     # -- per-layer RoPE tables / masks ------------------------------------------ #
     def _to_tt(self, t: torch.Tensor, device: ttnn.MeshDevice) -> ttnn.Tensor:
-        ttnn.ReadDeviceProfiler(device)
+        _profile(device)
 
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
@@ -2098,7 +2392,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 cache_len=cache_len,
             )
             last_submesh_id = current_submesh_id
-            ttnn.ReadDeviceProfiler(this_device)
+            _profile(this_device)
         return self.norm(self.hc_head(streams))
 
     def prefill(self, input_ids: torch.Tensor, rope: dict, cache_len: Optional[int] = None) -> ttnn.Tensor:
@@ -2149,8 +2443,289 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 input_ids=ids,
             )
             last_submesh_id = current_submesh_id
-            ttnn.ReadDeviceProfiler(this_device)
+            _profile(this_device)
         return self.norm(self.hc_head(streams))
+
+    # ------------------------------------------------------------------ #
+    # Traced decode (one reusable trace per submesh / device)
+    #
+    # The eager :meth:`decode` is host-bound: every step re-dispatches ~43
+    # layers' worth of ops, rebuilds the RoPE rows / masks from host, reads the
+    # MoE routing weights back to host, and host-copies the residual streams
+    # across submeshes. The traced path captures one ``ttnn`` trace per submesh
+    # (so each device replays its own slice of the stack) and, between replays,
+    # only writes the tiny per-step inputs (token id, RoPE rows, masks, cache
+    # positions, hash-router masks) into persistent device tensors and host-hops
+    # the streams between submeshes. All cross-token state lives in fixed-size
+    # in-place caches (:class:`_StaticLayerCache`) so a single capture serves
+    # every step. See :meth:`prepare_static_decode` / :meth:`decode_traced`.
+    # ------------------------------------------------------------------ #
+    def _rope_row_host(self, rope: dict, pos: int, rope_type: str):
+        """Host ``(cos, sin, neg_sin)`` ``[1,1,1,Rd]`` RoPE rows at ``pos`` for the
+        ``"main"`` (sliding) or ``"compress"`` (CSA/HCA) family."""
+        cos_h, sin_h = rope["main"] if rope_type == "main" else rope["compress"]
+        cos_full, sin_full = make_rope_table(cos_h[pos : pos + 1], sin_h[pos : pos + 1])
+        mk = lambda t: ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        return mk(cos_full), mk(sin_full), mk(-sin_full)
+
+    def _decode_mask_host(self, pos: int, layer_type: str, compress_rate: Optional[int], n_win_cap: int) -> ttnn.Tensor:
+        """Host additive decode mask ``[1,1,1,W(+n_win_cap)]`` for ``layer_type`` at ``pos``.
+
+        Sliding cols: a ring slot is valid iff its token has been written and is
+        within the window (``pos+1 >= W`` -> all valid, else slots ``0..pos``).
+        Compressor cols: window ``w`` is valid iff ``w < (pos+1)//compress_rate``
+        (the degenerate-indexer causal block bias). Invalid -> ``_MASK_NEG``.
+        """
+        w = self.sliding_window
+        slots = torch.arange(w)
+        sld_valid = torch.ones(w, dtype=torch.bool) if pos + 1 >= w else (slots <= pos)
+        sld = torch.zeros(w).masked_fill(~sld_valid, _MASK_NEG)
+        if layer_type == "sliding_attention":
+            row = sld
+        else:
+            entries = torch.arange(n_win_cap)
+            win = torch.zeros(n_win_cap).masked_fill(entries >= ((pos + 1) // compress_rate), _MASK_NEG)
+            row = torch.cat([sld, win], dim=0)
+        return ttnn.from_torch(row.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    def _build_static_layer_cache(self, li: int, device: ttnn.MeshDevice, real_len: int) -> "_StaticLayerCache":
+        """Seed a layer's fixed-size in-place caches from the eager prefill caches
+        (``self.kv_caches[li]``, populated by :meth:`prefill`)."""
+        kvc = self.kv_caches[li]
+        dh = self.config.head_dim
+        w = self.sliding_window
+        # Sliding ring buffer: place each kept rotated K=V at slot ``abs_pos % W``.
+        sld = ttnn.to_torch(kvc.sliding.kv).to(torch.float32)  # [1, 1, L, Dh]
+        length = sld.shape[2]
+        host_sld = torch.zeros(1, 1, w, dh)
+        for i in range(length):
+            host_sld[0, 0, (real_len - length + i) % w] = sld[0, 0, i]
+        sliding = ttnn.from_torch(
+            host_sld, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        ckv = cgate = None
+        layer_type = self.config.layer_types[li]
+        if layer_type != "sliding_attention":
+            cr = self.config.compress_rates[layer_type]
+            cap = self._cr_caps[cr][0]
+            feat = (2 if layer_type == "compressed_sparse_attention" else 1) * dh
+            ck = ttnn.to_torch(kvc.compressor.kv).to(torch.float32)  # [1, real_len, feat]
+            cg = ttnn.to_torch(kvc.compressor.gate).to(torch.float32)
+            n = min(cap, ck.shape[1])
+            hk = torch.zeros(1, 1, cap, feat)
+            hg = torch.zeros(1, 1, cap, feat)
+            hk[0, 0, :n] = ck[0, :n]
+            hg[0, 0, :n] = cg[0, :n]
+            ckv = ttnn.from_torch(
+                hk, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            cgate = ttnn.from_torch(
+                hg, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+        return _StaticLayerCache(sliding, ckv, cgate)
+
+    def prepare_static_decode(self, rope: dict, max_seq: int, real_len: int, lm_head=None) -> None:
+        """Allocate + seed the traced-decode state after a :meth:`prefill`.
+
+        Builds, per submesh: the fixed-size in-place caches (seeded from the eager
+        prefill caches), the persistent per-step input tensors (token id / streams,
+        RoPE rows, masks, cache positions, hash masks) and the constant window-RoPE
+        tables. ``max_seq`` must be a multiple of every compress-rate (the caller
+        pads it) so each compressor's fixed capacity tiles cleanly into windows.
+        ``lm_head`` (optional) is folded into the last submesh's trace so a step
+        returns logits directly.
+        """
+        if not self.use_submeshes:
+            raise NotImplementedError("traced decode requires use_submeshes=True")
+        cfg = self.config
+        for cr in {cfg.compress_rates[t] for t in cfg.layer_types[: self.num_layers] if t != "sliding_attention"}:
+            assert max_seq % cr == 0, f"max_seq ({max_seq}) must be a multiple of compress_rate {cr}"
+        self._traced_rope = rope
+        self._lm_head_traced = lm_head
+        self._cr_caps = {
+            cr: (max_seq, max_seq // cr)
+            for cr in {cfg.compress_rates[t] for t in cfg.layer_types[: self.num_layers] if t != "sliding_attention"}
+        }
+
+        rd = cfg.qk_rope_head_dim
+        hc, d, e, w = cfg.hc_mult, cfg.hidden_size, cfg.num_local_experts, self.sliding_window
+        num_sm = (self.num_layers + self.layers_per_device - 1) // self.layers_per_device
+
+        def _dev_zeros(shape, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+            tt_dtype = {ttnn.bfloat16: torch.float32, ttnn.uint32: torch.int32, ttnn.int32: torch.int32}[dtype]
+            return ttnn.from_torch(torch.zeros(shape, dtype=tt_dtype), dtype=dtype, layout=layout, device=device)
+
+        self.submeshes_io = []
+        for k in range(num_sm):
+            device = self.submeshes[k]
+            layers_k = [li for li in range(self.num_layers) if li // self.layers_per_device == k]
+            types = {cfg.layer_types[li] for li in layers_k}
+            crs = {cfg.compress_rates[t] for t in types if t != "sliding_attention"}
+            sm = {
+                "device": device,
+                "layers": layers_k,
+                "first": k == 0,
+                "last": layers_k and layers_k[-1] == self.num_layers - 1,
+                "pos_sliding": _dev_zeros([1], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT),
+                "pos_compress": _dev_zeros([1], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT),
+                "rope_in": {},
+                "mask_in": {},
+                "win_rope": {},
+                "hash_masks": {},
+                "scaches": {li: self._build_static_layer_cache(li, device, real_len) for li in layers_k},
+                "tid": None,
+                "output": None,
+            }
+            for rt in ({"main"} if "sliding_attention" in types else set()) | ({"compress"} if crs else set()):
+                sm["rope_in"][rt] = tuple(_dev_zeros([1, 1, 1, rd], device) for _ in range(3))
+            for lt in types:
+                width = w if lt == "sliding_attention" else w + self._cr_caps[cfg.compress_rates[lt]][1]
+                sm["mask_in"][lt] = _dev_zeros([1, 1, 1, width], device)
+            for cr in crs:
+                n_win_cap = self._cr_caps[cr][1]
+                cw, sw = make_rope_table(rope["win"][cr][0][:n_win_cap], rope["win"][cr][1][:n_win_cap])
+                sm["win_rope"][cr] = (
+                    ttnn.from_torch(cw, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                    ttnn.from_torch(sw, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                )
+            for li in layers_k:
+                if self.layers[li].mlp.is_hash:
+                    sm["hash_masks"][li] = _dev_zeros([1, 1, 1, e], device)
+            if k == 0:
+                sm["token_in"] = _dev_zeros([1, 1], device, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+            else:
+                sm["streams_in"] = _dev_zeros([1, 1, hc, d], device)
+            self.submeshes_io.append(sm)
+        self._traced_captured = False
+
+    def _decode_submesh_static(self, sm: dict) -> ttnn.Tensor:
+        """Run one submesh's slice of the decode stack over its persistent inputs /
+        in-place caches (shared by the compile run and the trace capture)."""
+        cfg = self.config
+        if sm["first"]:
+            inputs_embeds = self.embed_tokens(sm["token_in"])  # [1, 1, D]
+            b, s, d = inputs_embeds.shape
+            streams = ttnn.repeat(ttnn.reshape(inputs_embeds, [b, s, 1, d]), ttnn.Shape([1, 1, cfg.hc_mult, 1]))
+        else:
+            streams = sm["streams_in"]
+        for li in sm["layers"]:
+            layer = self.layers[li]
+            lt = cfg.layer_types[li]
+            rope_type = "main" if lt == "sliding_attention" else "compress"
+            cos, sin, neg_sin = sm["rope_in"][rope_type]
+            if lt == "sliding_attention":
+                cos_win = sin_win = None
+            else:
+                cos_win, sin_win = sm["win_rope"][cfg.compress_rates[lt]]
+            streams = layer.decode_static(
+                streams,
+                cos,
+                sin,
+                neg_sin,
+                cos_win,
+                sin_win,
+                sm["mask_in"][lt],
+                sm["scaches"][li],
+                sm["pos_sliding"],
+                sm["pos_compress"],
+                hash_mask=sm["hash_masks"].get(li),
+            )
+        if sm["last"]:
+            streams = self.norm(self.hc_head(streams))
+            if self._lm_head_traced is not None:
+                streams = self._lm_head_traced(streams)
+        return streams
+
+    def _set_step_inputs(self, token_id: int, pos: int) -> None:
+        """Write the per-step inputs (token id, RoPE rows, masks, cache positions,
+        hash masks) into every submesh's persistent device tensors (allocation-free
+        on device, so it is safe to interleave with ``execute_trace``)."""
+        cfg = self.config
+        w = self.sliding_window
+        ps = ttnn.from_torch(torch.tensor([pos % w], dtype=torch.int32), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
+        pc = ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
+        rope_host = {rt: self._rope_row_host(self._traced_rope, pos, rt) for rt in ("main", "compress")}
+        mask_host: dict = {}
+        for lt in {cfg.layer_types[li] for li in range(self.num_layers)}:
+            cr = None if lt == "sliding_attention" else cfg.compress_rates[lt]
+            n_win_cap = self._cr_caps[cr][1] if cr is not None else 0
+            mask_host[lt] = self._decode_mask_host(pos, lt, cr, n_win_cap)
+
+        for sm in self.submeshes_io:
+            ttnn.copy_host_to_device_tensor(ps, sm["pos_sliding"])
+            ttnn.copy_host_to_device_tensor(pc, sm["pos_compress"])
+            for rt, tensors in sm["rope_in"].items():
+                for src, dst in zip(rope_host[rt], tensors):
+                    ttnn.copy_host_to_device_tensor(src, dst)
+            for lt, dst in sm["mask_in"].items():
+                ttnn.copy_host_to_device_tensor(mask_host[lt], dst)
+            for li, dst in sm["hash_masks"].items():
+                mh = ttnn.from_torch(
+                    self.layers[li].mlp.gate.selection_mask(token_id), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+                )
+                ttnn.copy_host_to_device_tensor(mh, dst)
+        if self.submeshes_io:
+            ttnn.copy_host_to_device_tensor(
+                ttnn.from_torch(
+                    torch.tensor([[token_id]], dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
+                ),
+                self.submeshes_io[0]["token_in"],
+            )
+
+    def _stream_to_next_submesh(self, src: ttnn.Tensor, sm: dict) -> None:
+        """Host-hop the residual streams into a submesh's persistent input buffer
+        (allocation-free on device -> trace-replay safe)."""
+        host = ttnn.to_torch(src)
+        host_tt = ttnn.from_torch(host, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(host_tt, sm["streams_in"])
+
+    def _capture_traces(self) -> None:
+        """Capture one trace per submesh: a compile run (to JIT the programs, which
+        trace capture itself cannot do), then the recorded capture.
+
+        Each submesh is captured independently — capture only fixes program shapes
+        / buffer addresses, so the (stale) compile-run inputs are immaterial: any
+        cache rows the compile run writes are at the *same* device-indexed slots a
+        later replay overwrites with real values. The real per-step results always
+        come from the :meth:`decode_traced` replay loop, never the capture run.
+        """
+        for k, sm in enumerate(self.submeshes_io):
+            device = sm["device"]
+            logger.info(f"[traced-decode] capturing submesh {k} ({len(sm['layers'])} layers)")
+            out = self._decode_submesh_static(sm)  # compile run (JITs the programs)
+            ttnn.synchronize_device(device)
+            out.deallocate(True)
+            tid = ttnn.begin_trace_capture(device, cq_id=0)
+            with _trace_capture_guard():
+                out = self._decode_submesh_static(sm)
+            ttnn.end_trace_capture(device, tid, cq_id=0)
+            sm["tid"] = tid
+            sm["output"] = out  # persistent; overwritten in place by every execute_trace
+        self._traced_captured = True
+
+    def decode_traced(self, token_id: int, pos: int) -> ttnn.Tensor:
+        """One traced decode step: feed ``token_id`` at absolute position ``pos``.
+
+        Requires a prior :meth:`prefill` + :meth:`prepare_static_decode`. Captures
+        the per-submesh traces lazily on the first call, then (every call) refreshes
+        the per-step inputs, replays each submesh's trace in order, and host-hops the
+        residual streams between submeshes. Returns the last submesh's persistent
+        output tensor — logits ``[1,1,vocab]`` if an ``lm_head`` was passed to
+        :meth:`prepare_static_decode`, else the pre-head hidden ``[1,1,hidden]``.
+
+        The returned tensor is overwritten by the next call, so consume it (e.g.
+        ``ttnn.to_torch``) before decoding the following token.
+        """
+        self._set_step_inputs(token_id, pos)
+        if not self._traced_captured:
+            self._capture_traces()
+        prev_out = None
+        for k, sm in enumerate(self.submeshes_io):
+            if k > 0:
+                self._stream_to_next_submesh(prev_out, sm)
+            ttnn.execute_trace(sm["device"], sm["tid"], cq_id=0, blocking=False)
+            prev_out = sm["output"]
+        return self.submeshes_io[-1]["output"]
 
     def _copy_hidden_states_between_submeshes(self, hidden_states, from_submesh_id, to_submesh_id):
         """

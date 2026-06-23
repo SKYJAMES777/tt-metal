@@ -22,6 +22,7 @@ Run it (ttnn venv)::
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -130,10 +131,20 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
 
     # Wrap the user input in the V4 chat template, tokenize, and build the RoPE
     # tables for the longest sequence we might decode (prompt + new tokens).
+    # ``DEEPSEEK_V4_TRACED_DECODE``: replay one captured ttnn trace per submesh per
+    # step (fixed-size in-place caches) instead of the host-bound eager decode.
+    traced = os.environ.get("DEEPSEEK_V4_TRACED_DECODE", "0") not in ("0", "", "false", "False")
+
     prompt = render_message(0, [{"role": "user", "content": text}], "chat")
     prompt_ids: list[int] = list(tokenizer(prompt)["input_ids"])
     real_len = len(prompt_ids)
     max_seq = _pad_to_tile(real_len + max_new_tokens)
+    if traced:
+        # The fixed compressor buffers tile cleanly into windows only if the
+        # capacity is a multiple of every compress-rate, so round the span up.
+        crs = {int(v) for v in config.compress_rates.values()}
+        step = math.lcm(32, *crs) if crs else 32
+        max_seq = ((max_seq + step - 1) // step) * step
     rope = _build_rope(config, max_seq)
 
     max_layers = min(
@@ -170,6 +181,12 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
     generated: list[int] = [next_id]
     logger.info(f"prefill ({real_len} tokens) -> token id {next_id} {tokenizer.decode([next_id])!r}")
 
+    # Seed the fixed-size in-place decode caches from the prefill caches and fold
+    # the lm_head into the last submesh's trace (so a step returns logits directly).
+    if traced:
+        model.prepare_static_decode(rope, max_seq, real_len, lm_head=lm_head)
+        logger.info("traced decode: prepared static buffers; trace captured on first step")
+
     # Each step feeds the previously generated token at its absolute position and
     # reads back the single-token logits (no recompute over the prior context).
     import time
@@ -185,8 +202,12 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
             logger.warning(f"hit max RoPE length {max_seq}; stopping at {len(generated)} tokens")
             break
         t0 = time.perf_counter()
-        hidden = model.decode(next_id, pos, rope)  # [1, 1, D]
-        logits = ttnn.to_torch(lm_head(hidden)).reshape(1, -1).float()  # forces device sync
+        if traced:
+            logits_tt = model.decode_traced(next_id, pos)  # [1, 1, vocab] (lm_head in-trace)
+            logits = ttnn.to_torch(logits_tt).reshape(1, -1).float()  # forces device sync
+        else:
+            hidden = model.decode(next_id, pos, rope)  # [1, 1, D]
+            logits = ttnn.to_torch(lm_head(hidden)).reshape(1, -1).float()  # forces device sync
         next_id = int(logits[0].argmax().item())
         decode_time += time.perf_counter() - t0
         decode_tokens += 1
@@ -199,6 +220,8 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
                 f"decode throughput: {decode_tokens / decode_time:.2f} tok/s "
                 f"({decode_tokens} tokens in {decode_time:.2f}s)"
             )
+            decode_tokens = 0
+            decode_time = 0.0
 
     if decode_tokens:
         logger.info(
