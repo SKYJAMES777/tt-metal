@@ -28,7 +28,6 @@
 #include "sfpu/ckernel_sfpu_sigmoid.h"
 #include "sfpu/ckernel_sfpu_silu.h"
 #include "sfpu/ckernel_sfpu_sqrt.h"
-#include "sfpu/ckernel_sfpu_typecast.h"
 
 // Binary SFPU op headers (consumed by the binary dispatchers below). The op is
 // selected via the LLK ckernel::BinaryOp enum (reused like Blackhole; the
@@ -87,6 +86,10 @@ void init_unary_sfpu_operation_quasar()
     else if constexpr (is_zero_comp_op(OPERATION))
     {
         init_zero_comp();
+    }
+    else if constexpr (OPERATION == SfpuType::typecast)
+    {
+        _init_typecast_();
     }
     else if constexpr (OPERATION == SfpuType::typecast)
     {

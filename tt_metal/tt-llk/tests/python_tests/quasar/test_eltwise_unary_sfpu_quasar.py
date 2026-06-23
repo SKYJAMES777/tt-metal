@@ -670,6 +670,9 @@ def generate_sfpu_unary_combinations():
                 if is_invalid_quasar_sfpu_format_combination(
                     fmt, dest_acc, quasar_unpack_to_dest(fmt, dest_acc, is_typecast)
                 ):
+                if is_invalid_quasar_sfpu_format_combination(
+                    fmt, dest_acc, quasar_unpack_to_dest(fmt, dest_acc, is_typecast)
+                ):
                     continue
 
                 for dest_sync in cfg.dest_sync_modes:
