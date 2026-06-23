@@ -224,6 +224,7 @@ if __name__ == "__main__":
 # --------------------------------------------------------------------------- #
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import tempfile  # noqa: E402
 import types  # noqa: E402
 
 import pytest  # noqa: E402
@@ -257,9 +258,13 @@ PCC_THRESHOLD = 0.98
 DECODE_PCC_THRESHOLD = 0.97
 # How many tokens to decode (one device step each) past the seeded prefix.
 _DECODE_STEPS = 4
-# Opt-in on-disk cache (ttnn weight tiles + HF reference bundles). ``None`` keeps
-# caching off so every run reloads from the checkpoint (the default behaviour).
-_CACHE_DIR = os.environ.get("DEEPSEEK_V4_CACHE_DIR")
+# On-disk cache (ttnn weight tiles + HF reference bundles). Defaults to a dir
+# under the system temp dir so the slow bf4 expert conversion + HF reference
+# subprocess are reused across runs; override with ``DEEPSEEK_V4_CACHE_DIR`` (set
+# it to an empty string to disable caching and always reload from the checkpoint).
+_CACHE_DIR = (
+    os.environ.get("DEEPSEEK_V4_CACHE_DIR", os.path.join(tempfile.gettempdir(), "deepseek_v4_flash_cache")) or None
+)
 
 
 def _checkpoint_available() -> bool:
@@ -385,14 +390,16 @@ def test_decoder_layer_pcc(device, reset_seeds, tmp_path, layer_idx: int, batch_
     loader = DeepseekV4WeightLoader(_DEFAULT_MODEL_DIR)
     cache = _weight_cache(layer_idx)
     weights = _build_layer_weights(loader, layer_idx, layer_type)
-    # One layer of experts fits Blackhole DRAM in bf16, so the only precision gap
-    # vs the fp32 reference is bf16 device arithmetic (no 4-bit quant gap). With a
-    # cache the 256-expert dequant is skipped on a hit (the provider isn't called).
+    # The routed experts run through the single-op ``fused_experts`` kernel, which
+    # is hard-wired to Bfp4_b weights (its L1 circular-buffer budget assumes the
+    # 4-bit weight tiles), so the experts must be bf4. Everything else in the layer
+    # (attention, norms, shared expert) stays bf16, so the only precision gap vs the
+    # fp32 reference is the routed experts' 4-bit quant plus bf16 device arithmetic.
     experts = DeepSeekV4PreloadedExperts(
         cfg,
         _expert_provider(loader, layer_idx),
         device,
-        dtype=ttnn.bfloat16,
+        dtype=ttnn.bfloat4_b,
         cache=cache.sub("mlp") if cache else None,
     )
     layer = DeepSeekV4DecoderLayer(cfg, layer_idx, weights, device, experts=experts, cache=cache)
@@ -429,6 +436,7 @@ def _rope_rows(cos_half: torch.Tensor, sin_half: torch.Tensor, device) -> tuple:
 
 @pytest.mark.skipif(not _checkpoint_available(), reason=f"V4-Flash checkpoint not found under {_DEFAULT_MODEL_DIR}")
 @torch.no_grad()
+@pytest.mark.timeout(14400)  # heavy: bf4 conversion of every expert + many decode steps
 @pytest.mark.parametrize("layer_idx", (4, 5))  # 4 = CSA + moe, 5 = HCA + moe
 @pytest.mark.parametrize("seq_len", (256,))
 @pytest.mark.parametrize("batch_size", (1,))
@@ -463,10 +471,12 @@ def test_decoder_layer_decode_pcc(device, reset_seeds, tmp_path, layer_idx: int,
         cfg,
         _expert_provider(loader, layer_idx),
         device,
-        dtype=ttnn.bfloat16,
+        dtype=ttnn.bfloat4_b,
         cache=cache.sub("mlp") if cache else None,
     )
-    layer = DeepSeekV4DecoderLayer(cfg, layer_idx, weights, device, experts=experts, cache=cache)
+    layer = DeepSeekV4DecoderLayer(
+        cfg, layer_idx, weights, device, experts=experts, cache=cache, weight_dtype=ttnn.bfloat4_b
+    )
 
     streams = bundle["streams"]  # [B, S, hc_mult, D]
     reference = bundle["output"].to(torch.float32)  # full-prefill output [B, S, hc_mult, D]

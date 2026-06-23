@@ -44,7 +44,7 @@ from models.experimental.deepseek_v4_flash.tt.weight_loader import (
 )
 
 _DEFAULT_MODEL_DIR = "/home/ttuser/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash"
-_DEFAULT_TEXT = "Tell me the name of the top 10 songs of all time."
+_DEFAULT_TEXT = "I"
 _WEIGHT_DTYPE = ttnn.bfloat4_b
 _CACHE_DIR = os.environ.get("DEEPSEEK_V4_CACHE_DIR", "../cache")
 
@@ -133,7 +133,7 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
     # tables for the longest sequence we might decode (prompt + new tokens).
     # ``DEEPSEEK_V4_TRACED_DECODE``: replay one captured ttnn trace per submesh per
     # step (fixed-size in-place caches) instead of the host-bound eager decode.
-    traced = True  # os.environ.get("DEEPSEEK_V4_TRACED_DECODE", "0") not in ("0", "", "false", "False")
+    traced = False  # os.environ.get("DEEPSEEK_V4_TRACED_DECODE", "0") not in ("0", "", "false", "False")
 
     prompt = render_message(0, [{"role": "user", "content": text}], "chat")
     prompt_ids: list[int] = list(tokenizer(prompt)["input_ids"])

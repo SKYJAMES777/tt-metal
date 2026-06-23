@@ -23,6 +23,32 @@ def _profile(device) -> None:
         ttnn.ReadDeviceProfiler(device)
 
 
+# Tracy signposts let the (flat) device-op profile be sliced per decoder-layer
+# sub-module (attention, MoE router/experts/shared, hyper-connection, norms): each
+# ``_region`` emits a ``<NAME>_START`` / ``<NAME>_END`` host marker around the ops
+# it issues. ``tracy`` only imports on a profiler-enabled build, so degrade to a
+# no-op otherwise, and stay silent during a ttnn trace capture (no host calls).
+try:
+    from tracy import signpost as _tracy_signpost
+except Exception:  # pragma: no cover - tracy missing on non-profiling builds
+    _tracy_signpost = None
+
+
+def _signpost(header: str) -> None:
+    if _tracy_signpost is not None and not _IN_TRACE_CAPTURE:
+        _tracy_signpost(header=header)
+
+
+@contextmanager
+def _region(name: str):
+    """Wrap the enclosed ttnn ops in a Tracy ``<name>_START`` / ``<name>_END`` pair."""
+    _signpost(f"{name}_START")
+    try:
+        yield
+    finally:
+        _signpost(f"{name}_END")
+
+
 @contextmanager
 def _trace_capture_guard():
     """Silence :func:`_profile` for the duration of a trace capture."""
@@ -1404,9 +1430,14 @@ def _load_fused_weight(
     weight is cached in standard interleaved DRAM under its own cache entry and
     then resharded to the ND-shard layout on device.
     """
-    standard = _load_weight(tensor, device, cache_file_name=cache_file_name, dtype=dtype)
-    sharded = ttnn.to_memory_config(standard, nd_config)
-    ttnn.deallocate(standard)
+    sharded = ttnn.as_tensor(
+        tensor,
+        dtype=dtype,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=nd_config,
+        cache_file_name=cache_file_name,
+    )
     return sharded
 
 
@@ -1592,17 +1623,20 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         x_flat = ttnn.reshape(hidden, [1, 1, b * s, h])
         _profile(self.device)
 
-        if self.is_hash:
-            routing_weights = self.gate(x_flat, input_ids)  # [1, 1, T, E]
-        else:
-            routing_weights = self.gate(x_flat)  # [1, 1, T, E]
+        with _region("MOE_ROUTER"):
+            if self.is_hash:
+                routing_weights = self.gate(x_flat, input_ids)  # [1, 1, T, E]
+            else:
+                routing_weights = self.gate(x_flat)  # [1, 1, T, E]
         _profile(self.device)
 
-        routed = self.experts(x_flat, routing_weights)  # [1, 1, T, H]
-        routed = ttnn.reshape(routed, [b, s, h])
+        with _region("MOE_EXPERTS"):
+            routed = self.experts(x_flat, routing_weights)  # [1, 1, T, H]
+            routed = ttnn.reshape(routed, [b, s, h])
         _profile(self.device)
 
-        shared = self.shared_experts(hidden)  # [B, S, H]
+        with _region("MOE_SHARED"):
+            shared = self.shared_experts(hidden)  # [B, S, H]
 
         _profile(self.device)
 
@@ -1906,25 +1940,35 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         projections) for a subsequent :meth:`decode`; ``cache_len`` is the real
         (non-padding) token count.
         """
-        post, comb, collapsed = self.attn_hc(hidden_streams)
-        attn_out = self.self_attn(
-            self.input_layernorm(collapsed),
-            cos,
-            sin,
-            neg_sin,
-            mask,
-            cos_win=cos_win,
-            sin_win=sin_win,
-            kv_cache=kv_cache,
-            cache_len=cache_len,
-        )
-        hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
+        with _region("ATTN_HC"):
+            post, comb, collapsed = self.attn_hc(hidden_streams)
+        with _region("INPUT_NORM"):
+            normed = self.input_layernorm(collapsed)
+        with _region("ATTENTION"):
+            attn_out = self.self_attn(
+                normed,
+                cos,
+                sin,
+                neg_sin,
+                mask,
+                cos_win=cos_win,
+                sin_win=sin_win,
+                kv_cache=kv_cache,
+                cache_len=cache_len,
+            )
+        with _region("ATTN_MIX"):
+            hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
 
-        post, comb, collapsed = self.ffn_hc(hidden_streams)
-        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        with _region("FFN_HC"):
+            post, comb, collapsed = self.ffn_hc(hidden_streams)
+        with _region("POST_NORM"):
+            normed = self.post_attention_layernorm(collapsed)
+        with _region("MOE"):
+            mlp_out = self.mlp(normed, input_ids=input_ids)
         _profile(self.device)
 
-        return self._mix(post, comb, mlp_out, hidden_streams)
+        with _region("FFN_MIX"):
+            return self._mix(post, comb, mlp_out, hidden_streams)
 
     def decode(
         self,
@@ -1943,13 +1987,23 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         per-token, so this is the prefill block with ``S = 1`` and the cached
         attention substituted for the full-sequence attention.
         """
-        post, comb, collapsed = self.attn_hc(hidden_streams)
-        attn_out = self.self_attn.decode(self.input_layernorm(collapsed), cos, sin, neg_sin, cos_win, sin_win, kv_cache)
-        hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
+        with _region("ATTN_HC"):
+            post, comb, collapsed = self.attn_hc(hidden_streams)
+        with _region("INPUT_NORM"):
+            normed = self.input_layernorm(collapsed)
+        with _region("ATTENTION"):
+            attn_out = self.self_attn.decode(normed, cos, sin, neg_sin, cos_win, sin_win, kv_cache)
+        with _region("ATTN_MIX"):
+            hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
         _profile(self.device)
-        post, comb, collapsed = self.ffn_hc(hidden_streams)
-        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
-        return self._mix(post, comb, mlp_out, hidden_streams)
+        with _region("FFN_HC"):
+            post, comb, collapsed = self.ffn_hc(hidden_streams)
+        with _region("POST_NORM"):
+            normed = self.post_attention_layernorm(collapsed)
+        with _region("MOE"):
+            mlp_out = self.mlp(normed, input_ids=input_ids)
+        with _region("FFN_MIX"):
+            return self._mix(post, comb, mlp_out, hidden_streams)
 
     def decode_static(
         self,
@@ -2348,16 +2402,26 @@ class DeepSeekV4Model(DeepSeekV4Module):
         cache[key] = out
         return out
 
-    def _copy_streams_between_submeshes_host(self, streams, from_submesh_id: int, to_submesh_id: int):
-        """Move ``streams`` between submeshes via a host round-trip.
+    def _copy_streams_between_submeshes(self, streams, from_submesh_id: int, to_submesh_id: int, dst=None):
+        """Move the decode residual streams between two adjacent submeshes over the
+        pre-created socket pair — device-to-device, with no host round-trip.
 
-        A device-independent fallback to the socket path (:meth:`_copy_hidden_states_between_submeshes`)
-        for the tiny single-token decode stream, where host transfer latency is
-        negligible and we avoid depending on socket setup.
+        Used by both decode paths:
+          * eager :meth:`decode` (``dst is None``) — allocate a fresh tensor on the
+            target submesh and return it (the loop reassigns ``streams``).
+          * traced :meth:`decode_traced` (``dst`` given) — receive *in place* into
+            the target submesh's persistent per-step input buffer, so the captured
+            trace keeps reading the same address (allocation-free between replays).
         """
-        host = ttnn.to_torch(streams)
-        streams.deallocate(True)
-        return ttnn.from_torch(host, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.submeshes[to_submesh_id])
+        from_submesh = self.submeshes[from_submesh_id]
+        to_submesh = self.submeshes[to_submesh_id]
+        sender_socket, receiver_socket = self.submesh_socket_pairs[(from_submesh_id, to_submesh_id)]
+        output_tensor = dst if dst is not None else ttnn.allocate_tensor_on_device(streams.spec, to_submesh)
+        ttnn.experimental.send_async(streams, sender_socket)
+        ttnn.experimental.recv_async(output_tensor, receiver_socket)
+        if dst is None:
+            streams.deallocate(True)  # the persistent traced buffer must survive
+        return output_tensor
 
     def forward(
         self,
@@ -2391,7 +2455,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     logger.info(
                         f"Copying hidden states from submesh {last_submesh_id} to submesh {current_submesh_id} for layer {li}"
                     )
-                    streams = self._copy_hidden_states_between_submeshes(streams, last_submesh_id, current_submesh_id)
+                    streams = self._copy_streams_between_submeshes(streams, last_submesh_id, current_submesh_id)
                 this_device = self.submeshes[current_submesh_id]
             else:
                 this_device = self.first_device
@@ -2445,7 +2509,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
             if self.use_submeshes:
                 current_submesh_id = li // self.layers_per_device
                 if current_submesh_id != last_submesh_id:
-                    streams = self._copy_streams_between_submeshes_host(streams, last_submesh_id, current_submesh_id)
+                    streams = self._copy_streams_between_submeshes(streams, last_submesh_id, current_submesh_id)
                 this_device = self.submeshes[current_submesh_id]
             else:
                 this_device = self.first_device
@@ -2694,13 +2758,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 self.submeshes_io[0]["token_in"],
             )
 
-    def _stream_to_next_submesh(self, src: ttnn.Tensor, sm: dict) -> None:
-        """Host-hop the residual streams into a submesh's persistent input buffer
-        (allocation-free on device -> trace-replay safe)."""
-        host = ttnn.to_torch(src)
-        host_tt = ttnn.from_torch(host, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        ttnn.copy_host_to_device_tensor(host_tt, sm["streams_in"])
-
     def _capture_traces(self) -> None:
         """Capture one trace per submesh: a compile run (to JIT the programs, which
         trace capture itself cannot do), then the recorded capture.
@@ -2730,10 +2787,11 @@ class DeepSeekV4Model(DeepSeekV4Module):
 
         Requires a prior :meth:`prefill` + :meth:`prepare_static_decode`. Captures
         the per-submesh traces lazily on the first call, then (every call) refreshes
-        the per-step inputs, replays each submesh's trace in order, and host-hops the
-        residual streams between submeshes. Returns the last submesh's persistent
-        output tensor — logits ``[1,1,vocab]`` if an ``lm_head`` was passed to
-        :meth:`prepare_static_decode`, else the pre-head hidden ``[1,1,hidden]``.
+        the per-step inputs, replays each submesh's trace in order, and socket-copies
+        the residual streams between submeshes (device-to-device, no host hop).
+        Returns the last submesh's persistent output tensor — logits ``[1,1,vocab]``
+        if an ``lm_head`` was passed to :meth:`prepare_static_decode`, else the
+        pre-head hidden ``[1,1,hidden]``.
 
         The returned tensor is overwritten by the next call, so consume it (e.g.
         ``ttnn.to_torch``) before decoding the following token.
@@ -2744,23 +2802,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
         prev_out = None
         for k, sm in enumerate(self.submeshes_io):
             if k > 0:
-                self._stream_to_next_submesh(prev_out, sm)
+                self._copy_streams_between_submeshes(prev_out, k - 1, k, dst=sm["streams_in"])
             ttnn.execute_trace(sm["device"], sm["tid"], cq_id=0, blocking=False)
             prev_out = sm["output"]
         return self.submeshes_io[-1]["output"]
-
-    def _copy_hidden_states_between_submeshes(self, hidden_states, from_submesh_id, to_submesh_id):
-        """
-        Copy hidden_states from one submesh to another using the pre-created socket pair.
-        Sockets are created in the constructor and reused for every forward pass.
-        """
-        to_submesh = self.submeshes[to_submesh_id]
-        from_submesh = self.submeshes[from_submesh_id]
-        output_tensor = ttnn.allocate_tensor_on_device(hidden_states.spec, to_submesh)
-        sender_socket, receiver_socket = self.submesh_socket_pairs[(from_submesh_id, to_submesh_id)]
-        ttnn.experimental.send_async(hidden_states, sender_socket)
-        ttnn.experimental.recv_async(output_tensor, receiver_socket)
-        ttnn.synchronize_device(from_submesh)
-        ttnn.synchronize_device(to_submesh)
-        hidden_states.deallocate(True)
-        return output_tensor
