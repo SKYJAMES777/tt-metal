@@ -1533,6 +1533,21 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
                 _load_fused_weight(down_t(), device, down_nd, cache_file_name=cache.file(dn_f_name), dtype=dtype)
             )
 
+    def _run_fused(self, x_tok: ttnn.Tensor, routing_row: ttnn.Tensor, num_experts: int) -> ttnn.Tensor:
+        """Run ``fused_experts`` for one token. ``x_tok`` ``[1,1,1,H]`` (TILE) and
+        ``routing_row`` a ROW_MAJOR routing slice; returns ``[1,1,1,H]``."""
+        routing_row = ttnn.reshape(routing_row, [1, 1, 1, self.num_experts])
+        out = ttnn.experimental.deepseek.moe.fused_experts(
+            x_tok,
+            routing_weights=routing_row,
+            gate_up_weights=self._gate_up_fused,
+            down_weights=self._down_fused,
+            num_experts=num_experts,
+            intermediate_size=self.intermediate,
+            swiglu_limit=self.limit,
+        )  # [1, 1, H]
+        return ttnn.reshape(out, [1, 1, 1, self.hidden])
+
     def _decode_token(self, x_tok: ttnn.Tensor, rw_tok: ttnn.Tensor) -> ttnn.Tensor:
         """Run one token's routed FFN through ``fused_experts``.
 
@@ -1541,18 +1556,9 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         routing row itself, so we only pass ``num_experts`` = the hit count.
         """
         routing_row = ttnn.to_layout(rw_tok, ttnn.ROW_MAJOR_LAYOUT)
-        routing_row = ttnn.reshape(routing_row, [1, 1, 1, self.num_experts])
-        out = ttnn.experimental.deepseek.moe.fused_experts(
-            x_tok,
-            routing_weights=routing_row,
-            gate_up_weights=self._gate_up_fused,
-            down_weights=self._down_fused,
-            num_experts=6,
-            intermediate_size=self.intermediate,
-            swiglu_limit=self.limit,
-        )  # [1, 1, H]
+        out = self._run_fused(x_tok, routing_row, 6)
         _profile(self.device)
-        return ttnn.reshape(out, [1, 1, 1, self.hidden])
+        return out
 
     def forward(self, x_flat: ttnn.Tensor, routing_weights: ttnn.Tensor) -> ttnn.Tensor:
         """``x_flat`` ``[1,1,T,H]`` and ``routing_weights`` ``[1,1,T,E]``; returns ``[1,1,T,H]``.
@@ -1562,18 +1568,26 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         outputs are concatenated back into ``[1,1,T,H]``.
         """
         t = x_flat.shape[2]
-        # Read the (small) routing weights to host once: each token's op picks its
-        # own hit experts from its row, so no device-side gather is needed here.
         _profile(self.device)
 
         if t == 1:
             return self._decode_token(x_flat, routing_weights)
-        outs = [
-            self._decode_token(
-                ttnn.slice(x_flat, [0, 0, ti, 0], [1, 1, ti + 1, self.hidden]), routing_weights[0, 0, ti]
-            )
-            for ti in range(t)
-        ]
+
+        # Prefill loops the single-token op over ``T`` tokens. Slicing a single,
+        # non-tile-aligned row out of a TILE tensor forces an untilize/unpad +
+        # re-tilize per token (and the routing row needs a per-token untilize for
+        # the ROW_MAJOR op input). Hoist both layout conversions out of the loop:
+        # untilize ``x_flat`` / ``routing_weights`` once, slice rows cheaply in
+        # ROW_MAJOR, and tilize only the small ``[1,1,1,H]`` activation row the op
+        # actually consumes.
+        x_rm = ttnn.to_layout(x_flat, ttnn.ROW_MAJOR_LAYOUT)  # [1, 1, T, H]
+        rw_rm = ttnn.to_layout(routing_weights, ttnn.ROW_MAJOR_LAYOUT)  # [1, 1, T, E]
+        outs = []
+        for ti in range(t):
+            x_tok_rm = ttnn.slice(x_rm, [0, 0, ti, 0], [1, 1, ti + 1, self.hidden])
+            x_tok = ttnn.to_layout(x_tok_rm, ttnn.TILE_LAYOUT)
+            routing_row = ttnn.slice(rw_rm, [0, 0, ti, 0], [1, 1, ti + 1, self.num_experts])
+            outs.append(self._run_fused(x_tok, routing_row, 6))
         return ttnn.concat(outs, dim=2)  # [1, 1, T, H]
 
     def decode_static(self, x_tok: ttnn.Tensor, routing_weights: ttnn.Tensor) -> ttnn.Tensor:
