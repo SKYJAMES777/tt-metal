@@ -1216,6 +1216,12 @@ class DeepSeekV4TopKRouter(DeepSeekV4Module):
             device,
             cache_file_name=cache.file("gate.e_score_correction_bias"),
         )
+        # Persistent scatter operands for the trace-safe decode path (T == 1).
+        # ``ttnn.zeros`` / ``ttnn.ones`` host-init their buffers (a host->device
+        # write that is illegal mid-capture), so the static router reuses these
+        # pre-built constants instead of allocating + writing them each call.
+        self._scatter_zeros = ttnn.zeros([1, 1, 1, self.num_experts], ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, device)
+        self._scatter_ones = ttnn.ones([1, 1, 1, self.top_k], ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, device)
 
     def forward(self, x_flat: ttnn.Tensor) -> ttnn.Tensor:
         """``x_flat`` is ``[1, 1, T, H]``; returns routing weights ``[1, 1, T, E]``."""
@@ -1238,6 +1244,27 @@ class DeepSeekV4TopKRouter(DeepSeekV4Module):
         # Weights are the *unbiased* scores gathered at the selected experts,
         # normalised per token, then scaled. Masking before the sum makes the
         # dense [1,1,T,E] tensor equal the reference's gathered/normalised one.
+        selected = ttnn.multiply(scores, mask)
+        denom = ttnn.add(ttnn.sum(selected, dim=-1, keepdim=True), 1.0e-20)
+        return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
+
+    def forward_static(self, x_flat: ttnn.Tensor) -> ttnn.Tensor:
+        """Trace-safe single-token (``T == 1``) top-k routing -> ``[1,1,1,E]``.
+
+        Identical math to :meth:`forward`, but the scatter's zeros / ones operands
+        are the persistent constants built at init rather than freshly
+        ``ttnn.zeros`` / ``ttnn.ones`` tensors (whose host-init write is rejected
+        during trace capture). Scatter allocates its own output, which is allowed.
+        """
+        logits = self.gate(x_flat)  # [1, 1, 1, E]
+        scores = ttnn.sqrt(ttnn.softplus(logits))
+        biased = ttnn.add(scores, self.e_score_correction_bias)
+
+        _, top_idx = ttnn.topk(biased, self.top_k, dim=-1)  # [1, 1, 1, k]
+        top_idx = ttnn.to_layout(top_idx, ttnn.ROW_MAJOR_LAYOUT)
+        mask = ttnn.scatter(self._scatter_zeros, -1, top_idx, self._scatter_ones)
+        mask = ttnn.to_layout(mask, ttnn.TILE_LAYOUT)
+
         selected = ttnn.multiply(scores, mask)
         denom = ttnn.add(ttnn.sum(selected, dim=-1, keepdim=True), 1.0e-20)
         return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
@@ -1463,28 +1490,21 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
                 _load_fused_weight(down_t(), device, down_nd, cache_file_name=cache.file(dn_f_name), dtype=dtype)
             )
 
-    def _decode_token(self, x_tok: ttnn.Tensor, rw_tok: torch.Tensor) -> ttnn.Tensor:
+    def _decode_token(self, x_tok: ttnn.Tensor, rw_tok: ttnn.Tensor) -> ttnn.Tensor:
         """Run one token's routed FFN through ``fused_experts``.
 
         ``x_tok`` ``[1,1,1,H]`` and ``rw_tok`` the host routing-weight row ``[E]``;
         returns ``[1,1,1,H]``. The op finds the active (non-zero) experts from the
         routing row itself, so we only pass ``num_experts`` = the hit count.
         """
-        hit = (rw_tok.abs() > 0).nonzero().flatten().tolist()
-        if not hit:  # no expert selected (degenerate) -> zeros
-            return ttnn.multiply(x_tok, 0.0)
-        routing_row = ttnn.from_torch(
-            rw_tok.reshape(1, 1, 1, self.num_experts),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
-        )
+        routing_row = ttnn.to_layout(rw_tok, ttnn.ROW_MAJOR_LAYOUT)
+        routing_row = ttnn.reshape(routing_row, [1, 1, 1, self.num_experts])
         out = ttnn.experimental.deepseek.moe.fused_experts(
             x_tok,
             routing_weights=routing_row,
             gate_up_weights=self._gate_up_fused,
             down_weights=self._down_fused,
-            num_experts=len(hit),
+            num_experts=6,
             intermediate_size=self.intermediate,
             swiglu_limit=self.limit,
         )  # [1, 1, H]
@@ -1501,14 +1521,14 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         t = x_flat.shape[2]
         # Read the (small) routing weights to host once: each token's op picks its
         # own hit experts from its row, so no device-side gather is needed here.
-        rw_host = ttnn.to_torch(routing_weights).reshape(t, self.num_experts).float()
         _profile(self.device)
 
         if t == 1:
-            return self._decode_token(x_flat, rw_host[0])
-
+            return self._decode_token(x_flat, routing_weights)
         outs = [
-            self._decode_token(ttnn.slice(x_flat, [0, 0, ti, 0], [1, 1, ti + 1, self.hidden]), rw_host[ti])
+            self._decode_token(
+                ttnn.slice(x_flat, [0, 0, ti, 0], [1, 1, ti + 1, self.hidden]), routing_weights[0, 0, ti]
+            )
             for ti in range(t)
         ]
         return ttnn.concat(outs, dim=2)  # [1, 1, T, H]
@@ -1523,9 +1543,11 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         selects exactly ``top_k``), so the op's program — and hence the trace — is
         invariant across steps.
         """
+        routing_row = ttnn.to_layout(routing_weights, ttnn.ROW_MAJOR_LAYOUT)
+        routing_row = ttnn.reshape(routing_row, [1, 1, 1, self.num_experts])
         out = ttnn.experimental.deepseek.moe.fused_experts(
             x_tok,
-            routing_weights=routing_weights,
+            routing_weights=routing_row,
             gate_up_weights=self._gate_up_fused,
             down_weights=self._down_fused,
             num_experts=self.top_k,
@@ -1599,7 +1621,7 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         if self.is_hash:
             routing_weights = self.gate.forward_static(x_flat, hash_mask)
         else:
-            routing_weights = self.gate(x_flat)
+            routing_weights = self.gate.forward_static(x_flat)
         routed = self.experts.decode_static(x_flat, routing_weights)  # [1, 1, 1, H]
         routed = ttnn.reshape(routed, [1, 1, h])
         shared = self.shared_experts(hidden)
