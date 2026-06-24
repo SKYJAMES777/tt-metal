@@ -2081,6 +2081,12 @@ class DeepSeekV4Model(DeepSeekV4Module):
                             ttnn.MeshCoreCoord(coord, ttnn.CoreCoord(0, 0)),
                         )
                     )
+                    socket_connections.append(
+                        ttnn.SocketConnection(
+                            ttnn.MeshCoreCoord(coord, ttnn.CoreCoord(0, 1)),
+                            ttnn.MeshCoreCoord(coord, ttnn.CoreCoord(0, 1)),
+                        )
+                    )
                 socket_config = ttnn.SocketConfig(socket_connections, socket_memconfig)
                 sender_socket, receiver_socket = ttnn.create_socket_pair(from_submesh, to_submesh, socket_config)
                 self.submesh_socket_pairs[(from_id, to_id)] = (sender_socket, receiver_socket)
@@ -2281,8 +2287,8 @@ class DeepSeekV4Model(DeepSeekV4Module):
         to_submesh = self.submeshes[to_submesh_id]
         sender_socket, receiver_socket = self.submesh_socket_pairs[(from_submesh_id, to_submesh_id)]
         output_tensor = ttnn.allocate_tensor_on_device(streams.spec, to_submesh)
-        ttnn.experimental.send_async(streams, sender_socket)
-        ttnn.experimental.recv_async(output_tensor, receiver_socket)
+        ttnn.experimental.send_direct_async(streams, sender_socket)
+        ttnn.experimental.recv_direct_async(output_tensor, receiver_socket)
         streams.deallocate(True)
         return output_tensor
 
@@ -2503,7 +2509,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
             # the persistent input buffer. Captured inside this submesh's trace so
             # the cross-submesh copy needs no host-side op dispatch at replay time.
             _, receiver_socket = self.submesh_socket_pairs[(k - 1, k)]
-            ttnn.experimental.recv_async(sm["streams_in"], receiver_socket)
+            ttnn.experimental.recv_direct_async(sm["streams_in"], receiver_socket)
             streams = sm["streams_in"]
         for li in sm["layers"]:
             layer = self.layers[li]
@@ -2536,7 +2542,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
             # Captured inside this submesh's trace, so the cross-submesh copy is
             # dispatched on device at replay time (no host round-trip).
             sender_socket, _ = self.submesh_socket_pairs[(k, k + 1)]
-            ttnn.experimental.send_async(streams, sender_socket)
+            ttnn.experimental.send_direct_async(streams, sender_socket)
         return streams
 
     def _set_step_inputs(self, token_id: int, pos: int) -> None:
