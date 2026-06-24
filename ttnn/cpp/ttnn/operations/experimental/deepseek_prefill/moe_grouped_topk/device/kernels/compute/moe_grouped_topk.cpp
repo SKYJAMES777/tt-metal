@@ -277,7 +277,7 @@ void normalize_scores(
     const uint32_t cb_reciprocal_sums,
     const uint32_t cb_epsilon_scalar,
     const uint32_t cb_normalized_scores) {
-    reconfig_data_format(cb_gathered_sigmoid, cb_reduce_ones_scalar);
+    reconfig_data_format(cb_reduce_ones_scalar, cb_gathered_sigmoid);
     pack_reconfig_data_format(cb_normalized_scores);
     reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(
         cb_gathered_sigmoid, cb_reduce_ones_scalar, cb_reduce_intermediate);
