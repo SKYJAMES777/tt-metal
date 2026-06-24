@@ -299,18 +299,15 @@ std::vector<uint32_t> gold_standard_tilize_w_reduce_col_max(
     const int tile_c_dim = num_faces_c * face_c_dim;
     const int tile_elems = config.num_faces * face_elems;
 
-    // Reduce col max: 1 output tile-row, only row 0 populated per tile (rest zeroed by reduce mask)
-    std::vector<bfloat16> result(num_tile_cols * tile_elems, bfloat16(0.0f));
+    // Reduce col max per tile row: each tile is reduced independently (no accumulation across tile rows)
+    std::vector<bfloat16> result(num_tile_rows * num_tile_cols * tile_elems, bfloat16(0.0f));
     std::vector<float> col_max(tile_c_dim, -std::numeric_limits<float>::max());
 
-    for (int tc = 0; tc < num_tile_cols; tc++) {  // iterate over tile columns
-        std::fill(col_max.begin(), col_max.end(), -std::numeric_limits<float>::max());
+    for (int tr = 0; tr < num_tile_rows; tr++) {
+        for (int tc = 0; tc < num_tile_cols; tc++) {
+            std::fill(col_max.begin(), col_max.end(), -std::numeric_limits<float>::max());
 
-        // Accumulate column-wise max across every tile row in this tile column
-        for (int tr = 0; tr < num_tile_rows; tr++) {
             int tile_offset = (tr * num_tile_cols + tc) * tile_elems;
-
-            // Iterate faces within the tile: fr selects face row, fc selects face column
             for (int fr = 0; fr < num_faces_r; fr++) {
                 for (int fc = 0; fc < num_faces_c; fc++) {
                     int face_offset = tile_offset + (fr * num_faces_c + fc) * face_elems;
@@ -323,15 +320,14 @@ std::vector<uint32_t> gold_standard_tilize_w_reduce_col_max(
                     }
                 }
             }
-        }
 
-        // Place the reduced max values (scaled) into row 0 of output tile tc.
-        int out_offset = tc * tile_elems;
-        for (int fc = 0; fc < num_faces_c; fc++) {
-            int face_start = out_offset + fc * face_elems;
-            int col_base = fc * face_c_dim;
-            for (int c = 0; c < face_c_dim; c++) {
-                result[face_start + c] = bfloat16(col_max[col_base + c] * scaler);
+            int out_offset = (tr * num_tile_cols + tc) * tile_elems;
+            for (int fc = 0; fc < num_faces_c; fc++) {
+                int face_start = out_offset + fc * face_elems;
+                int col_base = fc * face_c_dim;
+                for (int c = 0; c < face_c_dim; c++) {
+                    result[face_start + c] = bfloat16(col_max[col_base + c] * scaler);
+                }
             }
         }
     }

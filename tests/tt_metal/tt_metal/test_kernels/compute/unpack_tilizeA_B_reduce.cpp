@@ -23,27 +23,25 @@ void kernel_main() {
 
     dfb_in_scaler.wait_front(1);
 
-    tile_regs_acquire();
-    tile_regs_wait();
     for (uint32_t b = 0; b < per_core_block_cnt; ++b) {
         dfb_in.wait_front(per_core_block_tile_cnt);
+        dfb_out.reserve_back(per_core_block_tile_cnt);
         unpack_tilizeA_B_block<true /*neginf_srcA*/, true /*reload_srcB*/, false, false>(
             dfb::in_data,
             dfb::in_scaler,
             per_core_block_tile_cnt,
             0 /*tile idx for Src b is 0 because only 1 scaler tile is loaded*/);
         for (uint32_t i = 0; i < per_core_block_tile_cnt; ++i) {
-            reduce_tile_math<REDUCE_OP, REDUCE_DIM>(i);
+            tile_regs_acquire();
+            reduce_tile_math<REDUCE_OP, REDUCE_DIM>(0);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile(0, dfb::out);
+            tile_regs_release();
         }
+        dfb_out.push_back(per_core_block_tile_cnt);
         dfb_in.pop_front(per_core_block_tile_cnt);
     }
-    for (uint32_t i = 0; i < per_core_block_tile_cnt; ++i) {
-        dfb_out.reserve_back(1);
-        pack_tile(i, dfb::out);
-        dfb_out.push_back(1);
-    }
-    tile_regs_commit();
-    tile_regs_release();
 
     reduce_uninit();
 }

@@ -521,15 +521,15 @@ void run_single_core_unpack_tilizeA_B_program(
 
 // Metal 2.0 single-core helper for the Quasar `unpack_tilizeA_B` + reduce path.
 // Quasar's unpack_tilizeA_B is only compatible with the reduce math kernel (not eltwise binary).
-// Uses REDUCE_COL + MAX: tilizes row-major src0 data, reduces across rows (H dimension),
-// producing one row of output tiles with only row 0 populated.
+// Uses REDUCE_COL + MAX: tilizes row-major src0 data, reduces each tile independently
+// (column-wise max within each tile), producing output tiles with only row 0 populated.
 void run_single_core_unpack_tilizeA_B_reduce_program(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device, const TestConfig& test_config) {
     auto& cq = mesh_device->mesh_command_queue();
     const experimental::NodeCoord node{0, 0};
 
     const uint32_t num_tiles_in = test_config.num_tiles_r * test_config.num_tiles_c;
-    const uint32_t num_tiles_out = test_config.num_tiles_c;  // reduce col: 1 output row of tiles
+    const uint32_t num_tiles_out = num_tiles_in;  // each tile reduced independently, same count as input
     const uint32_t input_dram_buffer_size = test_config.input_single_tile_size * num_tiles_in;
 
     auto make_flat_tensor_spec = [](uint32_t entry_size, uint32_t total_entries) {
@@ -1210,7 +1210,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarComputeUnpackTilizeA_B) {
                     .input_single_tile_size = tile_size,
                     .output_single_tile_size = output_tile_size,
                     .num_tiles_r = 2,
-                    .num_tiles_c = fp32_dest_acc_en ? 4 : 8,
+                    .num_tiles_c = 10,
                     .tilize_type = unit_tests::compute::tilize::TilizeType::UNPACK_A_B,
                     .input_fmt = data_format,
                     .output_fmt = output_data_format,
