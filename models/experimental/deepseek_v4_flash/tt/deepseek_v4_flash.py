@@ -954,6 +954,33 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         # transfer that is illegal inside a trace, so the traced decode path passes
         # this pre-uploaded tensor instead.
         self.sinks_tt = ttnn.from_torch(self.sinks_torch, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # Sink for the fused SDPA-decode op (:meth:`_sdpa_decode`). That kernel
+        # multiplies ``scale`` into BOTH the QK logits and the sink before the
+        # exp, but the reference (and the manual ``_attention``) leaves the sink
+        # un-scaled, so we pre-divide by ``scaling`` to cancel it. Shape ``[H, TILE]``
+        # (per-head, tile-padded width), resident so the call stays trace-safe.
+        sdpa_sink = self.sinks_torch.reshape(self.num_heads, 1) / self.scaling
+        sdpa_sink = torch.nn.functional.pad(sdpa_sink, (0, ttnn.TILE_SIZE - 1), "constant", value=0.0)
+        self.sdpa_sinks_tt = ttnn.from_torch(sdpa_sink, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        # SDPA-decode needs an explicit program config (k_chunk_size) when given an
+        # attn_mask. The K=V sequence (sliding window + compressor windows) is a
+        # multiple of the tile size, so a 32-wide chunk divides it cleanly.
+        #
+        # ``max_cores_per_head_batch`` (NOT the grid) is the L1 lever here: this is
+        # MQA (one shared KV head) at batch 1, so there is a single reduction group
+        # and the op assigns ``min(grid, max_cores_per_head_batch)`` cores to reduce
+        # that one head. Its per-core reduction-scratch CB grows as
+        # ``(out_tiles + 2*PNHt) * (cores_per_head - 1)``; with the default 16 and
+        # ``head_dim == 256`` that overflows L1 (~1.8 MB > 1.5 MB), independent of
+        # the grid. Capping it to 4 shrinks that CB ~5x while still parallelising
+        # the KV reduction 4 ways.
+        self._sdpa_pcfg = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=device.compute_with_storage_grid_size(),
+            q_chunk_size=0,
+            k_chunk_size=32,
+            exp_approx_mode=False,
+            max_cores_per_head_batch=4,
+        )
 
         # The rotate-half matrix must stay precise (a bf4 rotation would corrupt RoPE).
         self.rot = _load_weight(_interleaved_rotate_matrix(self.rope_dim), device, cache_file_name=cache.file("rot"))
@@ -1001,6 +1028,36 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         probs = ttnn.div(exp_scores, denom)
         attn = ttnn.matmul(probs, k, compute_kernel_config=_HIFI4)  # [B, H, S, Dh]
         return attn
+
+    def _sdpa_decode(self, q: ttnn.Tensor, kv: ttnn.Tensor, mask: ttnn.Tensor) -> ttnn.Tensor:
+        """Single-token (``S == 1``) attention via the fused SDPA-decode op.
+
+        Drop-in for :meth:`_attention` on the decode paths: fuses the scale, the
+        additive ``mask``, the per-head sink, and both matmuls into one device op.
+
+        ``q`` ``[1, H, 1, Dh]``; ``kv`` is the shared K==V ``[1, 1, Skv, Dh]``
+        (MQA, one KV head); ``mask`` ``[1, 1, 1, Skv]`` additive (``0`` valid /
+        ``_MASK_NEG`` masked). The op consumes Q as ``[1, B, H, Dh]`` (one row per
+        batch) and emits the same, so we swap the head/seq axes around the call.
+
+        The op requires the mask to carry the same (padded) head count as Q, so the
+        head-independent ``mask`` is broadcast across the ``H`` head axis first.
+        """
+        q_in = ttnn.transpose(q, 1, 2)  # [1, H, 1, Dh] -> [1, 1, H, Dh]
+        mask_h = ttnn.repeat(mask, ttnn.Shape([1, 1, self.num_heads, 1]))  # [1, 1, H, Skv]
+        attn = ttnn.transformer.scaled_dot_product_attention_decode(
+            q_in,
+            kv,
+            kv,  # K == V (shared single KV head)
+            is_causal=False,
+            attn_mask=mask_h,
+            attention_sink=self.sdpa_sinks_tt,
+            scale=self.scaling,
+            program_config=self._sdpa_pcfg,
+            compute_kernel_config=_HIFI4,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )  # [1, 1, H, Dh]
+        return ttnn.transpose(attn, 1, 2)  # -> [1, H, 1, Dh]
 
     def _grouped_output(self, attn: ttnn.Tensor) -> ttnn.Tensor:
         """``DeepseekV4GroupedLinear`` (o_a) + ``o_b_proj``.
@@ -1127,7 +1184,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         _profile(self.device)
 
         mask = ttnn.zeros([1, 1, s, kv.shape[2]], ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device)
-        attn = self._attention(q, kv, mask)  # [B, H, 1, Dh]
+        attn = self._sdpa_decode(q, kv, mask)  # [B, H, 1, Dh]
 
         attn = _apply_rope(attn, cos, neg_sin, self.rot, self.rope_dim)
         attn = ttnn.transpose(attn, 1, 2)  # [B, 1, H, Dh]
@@ -1166,7 +1223,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
             )
             kv = ttnn.concat([kv, compressed], dim=2)  # [1, 1, window + n_win, Dh]
 
-        attn = self._attention(q, kv, mask, sinks=self.sinks_tt)  # [1, H, 1, Dh]
+        attn = self._sdpa_decode(q, kv, mask)  # [1, H, 1, Dh]
         attn = _apply_rope(attn, cos, neg_sin, self.rot, self.rope_dim)
         attn = ttnn.transpose(attn, 1, 2)  # [1, 1, H, Dh]
         return self._grouped_output(attn)
