@@ -2269,25 +2269,21 @@ class DeepSeekV4Model(DeepSeekV4Module):
         cache[key] = out
         return out
 
-    def _copy_streams_between_submeshes(self, streams, from_submesh_id: int, to_submesh_id: int, dst=None):
+    def _copy_streams_between_submeshes(self, streams, from_submesh_id: int, to_submesh_id: int):
         """Move the decode residual streams between two adjacent submeshes over the
         pre-created socket pair — device-to-device, with no host round-trip.
 
-        Used by both decode paths:
-          * eager :meth:`decode` (``dst is None``) — allocate a fresh tensor on the
-            target submesh and return it (the loop reassigns ``streams``).
-          * traced :meth:`decode_traced` (``dst`` given) — receive *in place* into
-            the target submesh's persistent per-step input buffer, so the captured
-            trace keeps reading the same address (allocation-free between replays).
+        Used by the eager :meth:`decode` path: allocate a fresh tensor on the target
+        submesh, receive into it, and return it (the loop reassigns ``streams``). The
+        traced path instead folds the send/recv directly into each submesh's trace
+        (see :meth:`_decode_submesh_static`).
         """
-        from_submesh = self.submeshes[from_submesh_id]
         to_submesh = self.submeshes[to_submesh_id]
         sender_socket, receiver_socket = self.submesh_socket_pairs[(from_submesh_id, to_submesh_id)]
-        output_tensor = dst if dst is not None else ttnn.allocate_tensor_on_device(streams.spec, to_submesh)
+        output_tensor = ttnn.allocate_tensor_on_device(streams.spec, to_submesh)
         ttnn.experimental.send_async(streams, sender_socket)
         ttnn.experimental.recv_async(output_tensor, receiver_socket)
-        if dst is None:
-            streams.deallocate(True)  # the persistent traced buffer must survive
+        streams.deallocate(True)
         return output_tensor
 
     def decode(self, token_id: int, pos: int, rope: dict) -> ttnn.Tensor:
@@ -2344,8 +2340,9 @@ class DeepSeekV4Model(DeepSeekV4Module):
     # across submeshes. The traced path captures one ``ttnn`` trace per submesh
     # (so each device replays its own slice of the stack) and, between replays,
     # only writes the tiny per-step inputs (token id, RoPE rows, masks, cache
-    # positions, hash-router masks) into persistent device tensors and host-hops
-    # the streams between submeshes. All cross-token state lives in fixed-size
+    # positions, hash-router masks) into persistent device tensors; the streams
+    # are socket-copied between submeshes from inside the traces themselves (no
+    # per-step host op dispatch). All cross-token state lives in fixed-size
     # in-place caches (:class:`_StaticLayerCache`) so a single capture serves
     # every step. See :meth:`prepare_static_decode` / :meth:`decode_traced`.
     # ------------------------------------------------------------------ #
@@ -2456,6 +2453,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
             crs = {cfg.compress_rates[t] for t in types if t != "sliding_attention"}
             sm = {
                 "device": device,
+                "index": k,
                 "layers": layers_k,
                 "first": k == 0,
                 "last": layers_k and layers_k[-1] == self.num_layers - 1,
@@ -2495,11 +2493,17 @@ class DeepSeekV4Model(DeepSeekV4Module):
         """Run one submesh's slice of the decode stack over its persistent inputs /
         in-place caches (shared by the compile run and the trace capture)."""
         cfg = self.config
+        k = sm["index"]
         if sm["first"]:
             inputs_embeds = self.embed_tokens(sm["token_in"])  # [1, 1, D]
             b, s, d = inputs_embeds.shape
             streams = ttnn.repeat(ttnn.reshape(inputs_embeds, [b, s, 1, d]), ttnn.Shape([1, 1, cfg.hc_mult, 1]))
         else:
+            # Receive the residual streams from the previous submesh directly into
+            # the persistent input buffer. Captured inside this submesh's trace so
+            # the cross-submesh copy needs no host-side op dispatch at replay time.
+            _, receiver_socket = self.submesh_socket_pairs[(k - 1, k)]
+            ttnn.experimental.recv_async(sm["streams_in"], receiver_socket)
             streams = sm["streams_in"]
         for li in sm["layers"]:
             layer = self.layers[li]
@@ -2527,6 +2531,12 @@ class DeepSeekV4Model(DeepSeekV4Module):
             streams = self.norm(self.hc_head(streams))
             if self._lm_head_traced is not None:
                 streams = self._lm_head_traced(streams)
+        else:
+            # Send the residual streams to the next submesh over the socket pair.
+            # Captured inside this submesh's trace, so the cross-submesh copy is
+            # dispatched on device at replay time (no host round-trip).
+            sender_socket, _ = self.submesh_socket_pairs[(k, k + 1)]
+            ttnn.experimental.send_async(streams, sender_socket)
         return streams
 
     def _set_step_inputs(self, token_id: int, pos: int) -> None:
@@ -2574,13 +2584,26 @@ class DeepSeekV4Model(DeepSeekV4Module):
         cache rows the compile run writes are at the *same* device-indexed slots a
         later replay overwrites with real values. The real per-step results always
         come from the :meth:`decode_traced` replay loop, never the capture run.
+
+        The compile runs are issued for *all* submeshes before synchronizing,
+        because each submesh's slice now contains the cross-submesh socket
+        send/recv: a lone ``send_async`` followed by a blocking per-submesh
+        ``synchronize_device`` would deadlock (the residual streams exceed the
+        socket's L1 buffer, so the send cannot drain until the next submesh posts
+        its matching ``recv_async``). Issuing every submesh first lets the sends
+        and receives pair up across devices, after which a single sync drains
+        them. Trace capture only records ops (it does not execute them), so the
+        capture loop is free of this hazard.
         """
-        for k, sm in enumerate(self.submeshes_io):
-            device = sm["device"]
-            logger.info(f"[traced-decode] capturing submesh {k} ({len(sm['layers'])} layers)")
-            out = self._decode_submesh_static(sm)  # compile run (JITs the programs)
-            ttnn.synchronize_device(device)
+        compile_outs = []
+        for sm in self.submeshes_io:
+            logger.info(f"[traced-decode] compiling submesh {sm['index']} ({len(sm['layers'])} layers)")
+            compile_outs.append(self._decode_submesh_static(sm))  # compile run (JITs the programs)
+        for out in compile_outs:
             out.deallocate(True)
+        for sm in self.submeshes_io:
+            device = sm["device"]
+            logger.info(f"[traced-decode] capturing submesh {sm['index']} ({len(sm['layers'])} layers)")
             tid = ttnn.begin_trace_capture(device, cq_id=0)
             with _trace_capture_guard():
                 out = self._decode_submesh_static(sm)
@@ -2594,8 +2617,9 @@ class DeepSeekV4Model(DeepSeekV4Module):
 
         Requires a prior :meth:`prepare_static_decode`. Captures
         the per-submesh traces lazily on the first call, then (every call) refreshes
-        the per-step inputs, replays each submesh's trace in order, and socket-copies
-        the residual streams between submeshes (device-to-device, no host hop).
+        the per-step inputs and replays each submesh's trace in order. The residual
+        streams are socket-copied between submeshes from *inside* each trace
+        (device-to-device, no host hop and no per-step host op dispatch).
         Returns the last submesh's persistent output tensor — logits ``[1,1,vocab]``
         if an ``lm_head`` was passed to :meth:`prepare_static_decode`, else the
         pre-head hidden ``[1,1,hidden]``.
@@ -2606,10 +2630,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
         self._set_step_inputs(token_id, pos)
         if not self._traced_captured:
             self._capture_traces()
-        prev_out = None
-        for k, sm in enumerate(self.submeshes_io):
-            if k > 0:
-                self._copy_streams_between_submeshes(prev_out, k - 1, k, dst=sm["streams_in"])
+        for sm in self.submeshes_io:
             ttnn.execute_trace(sm["device"], sm["tid"], cq_id=0, blocking=False)
-            prev_out = sm["output"]
         return self.submeshes_io[-1]["output"]
