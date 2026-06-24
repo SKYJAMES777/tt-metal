@@ -23,7 +23,6 @@ std::vector<uint32_t> gold_standard_untilize(const std::vector<uint32_t>& src_ve
 
     int num_tile_rows = config.num_tiles_r_dim;
     int num_tile_cols = config.num_tiles_c_dim;
-
     // Number of uint32 words per face row: face_c_dim elements × datum_bytes / 4 bytes per uint32
     // BF16 (datum_bytes=2): 16*2/4 = 8  FP8 (datum_bytes=1): 16*1/4 = 4
     int num_c_dim = config.face_c_dim * static_cast<int>(config.datum_bytes) / 4;
@@ -290,43 +289,50 @@ std::vector<uint32_t> gold_standard_tilize_w_reduce_col_max(
     std::vector<uint32_t> tilized = gold_standard_tilize(src0_vec, config);
     std::vector<bfloat16> tilized_unpacked = tt::test_utils::unpack_vector<bfloat16, uint32_t>(tilized);
 
-    int num_tiles_r = config.num_tiles_r_dim;
-    int num_tiles_c = config.num_tiles_c_dim;
-    constexpr int face_dim = 16;
-    constexpr int face_elems = face_dim * face_dim;
-    constexpr int tile_elems = 4 * face_elems;
+    const int num_tile_rows = config.num_tiles_r_dim;
+    const int num_tile_cols = config.num_tiles_c_dim;
+    const int face_r_dim = config.face_r_dim;
+    const int face_c_dim = config.face_c_dim;
+    const int num_faces_c = (config.num_faces >= 2) ? 2 : 1;
+    const int num_faces_r = (config.num_faces > 2) ? 2 : 1;
+    const int face_elems = face_r_dim * face_c_dim;
+    const int tile_c_dim = num_faces_c * face_c_dim;
+    const int tile_elems = config.num_faces * face_elems;
 
-    // Reduce column with PoolType::MAX
-    // Output: 1 tile-row x num_tiles_c tiles, only row 0 populated (reduce mask zeros the rest)
-    std::vector<bfloat16> result(num_tiles_c * tile_elems, bfloat16(0.0f));
+    // Reduce col max: 1 output tile-row, only row 0 populated per tile (rest zeroed by reduce mask)
+    std::vector<bfloat16> result(num_tile_cols * tile_elems, bfloat16(0.0f));
+    std::vector<float> col_max(tile_c_dim, -std::numeric_limits<float>::max());
 
-    for (int tc = 0; tc < num_tiles_c; tc++) {  // iterate over tile columns
-        std::vector<float> col_max(32, -std::numeric_limits<float>::max());
+    for (int tc = 0; tc < num_tile_cols; tc++) {  // iterate over tile columns
+        std::fill(col_max.begin(), col_max.end(), -std::numeric_limits<float>::max());
 
-        for (int tr = 0; tr < num_tiles_r; tr++) {  // iterate over tile rows
-            int tile_offset = (tr * num_tiles_c + tc) * tile_elems;
+        // Accumulate column-wise max across every tile row in this tile column
+        for (int tr = 0; tr < num_tile_rows; tr++) {
+            int tile_offset = (tr * num_tile_cols + tc) * tile_elems;
 
-            for (int row = 0; row < 32; row++) {
-                int face_row = row / face_dim;
-                int row_within_face = row % face_dim;
-                for (int col = 0; col < 32; col++) {
-                    int face_col = col / face_dim;
-                    int col_within_face = col % face_dim;
-                    int face_index = face_row * 2 + face_col;
-                    int elem = tile_offset + face_index * face_elems + row_within_face * face_dim + col_within_face;
-                    col_max[col] = fmaxf(col_max[col], static_cast<float>(tilized_unpacked[elem]));
+            // Iterate faces within the tile: fr selects face row, fc selects face column
+            for (int fr = 0; fr < num_faces_r; fr++) {
+                for (int fc = 0; fc < num_faces_c; fc++) {
+                    int face_offset = tile_offset + (fr * num_faces_c + fc) * face_elems;
+                    int col_base = fc * face_c_dim;
+                    for (int r = 0; r < face_r_dim; r++) {
+                        for (int c = 0; c < face_c_dim; c++) {
+                            float val = static_cast<float>(tilized_unpacked[face_offset + r * face_c_dim + c]);
+                            col_max[col_base + c] = fmaxf(col_max[col_base + c], val);
+                        }
+                    }
                 }
             }
         }
 
+        // Place the reduced max values (scaled) into row 0 of output tile tc.
         int out_offset = tc * tile_elems;
-        // Row 0, cols 0-15 -> Face 0, row 0
-        for (int c = 0; c < face_dim; c++) {
-            result[out_offset + c] = bfloat16(col_max[c] * scaler);
-        }
-        // Row 0, cols 16-31 -> Face 1, row 0
-        for (int c = face_dim; c < 32; c++) {
-            result[out_offset + face_elems + (c - face_dim)] = bfloat16(col_max[c] * scaler);
+        for (int fc = 0; fc < num_faces_c; fc++) {
+            int face_start = out_offset + fc * face_elems;
+            int col_base = fc * face_c_dim;
+            for (int c = 0; c < face_c_dim; c++) {
+                result[face_start + c] = bfloat16(col_max[col_base + c] * scaler);
+            }
         }
     }
 
