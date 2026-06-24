@@ -297,10 +297,10 @@ static std::array<uint32_t, 6> extract_padding_values(
         padding);
 }
 
-// Helper function to validate height sharding
+// Used only by the legacy `use_transpose_as_fold=true` path; modern path handles W/B natively.
 static void validate_height_sharding(const Tensor& tensor) {
     if (tensor.is_sharded() && tensor.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED) {
-        TT_THROW("fold op does not support non height-sharding!");
+        TT_THROW("fold op (use_transpose_as_fold=true) does not support non height-sharding!");
     }
 }
 
@@ -432,10 +432,13 @@ Tensor fold(
                    input_tensor, output_shape, stride_h, stride_w, pad_c, pad_h, pad_w)
             .at(0);
     }
-    // Modern sharded tensor path
-    if (input_tensor.memory_config().is_l1() && input_tensor.is_sharded()) {
-        operations::data_movement::validate_height_sharding(input_tensor);
+    // Path B — HEIGHT_SHARDED + ROW_MAJOR zero-NOC fast path; everything else falls to Path C.
+    const bool height_sharded_rm_fast_path =
+        input_tensor.memory_config().is_l1() && input_tensor.is_sharded() &&
+        input_tensor.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+        input_tensor.layout() == Layout::ROW_MAJOR;
 
+    if (height_sharded_rm_fast_path) {
         Tensor processed_tensor = input_tensor;
 
         // Apply H,W padding using halo if needed
@@ -456,16 +459,13 @@ Tensor fold(
                 ::ttnn::pad(processed_tensor, padded_shape, tt::tt_metal::Array4D({0, 0, 0, pad_c_front}), 0);
         }
 
-        // If processed tensor is tiled, convert to row-major.
-        if (processed_tensor.layout() == Layout::TILE) {
-            processed_tensor = ttnn::to_layout(processed_tensor, Layout::ROW_MAJOR);
-        }
         // Reshard if needed for optimal fold computation
         processed_tensor = operations::data_movement::reshard_if_needed(processed_tensor, stride_h, stride_w);
 
         return ttnn::prim::fold(processed_tensor, stride_h, stride_w);
     }
-    // Interleaved tensor path (DRAM or L1)
+
+    // Path C — interleaved / W,B-sharded / HEIGHT+TILE all go through MultiCoreDRAMFold.
     Tensor processed_tensor = input_tensor;
 
     // Apply padding if needed
@@ -486,14 +486,10 @@ Tensor fold(
     const auto in_channels = shape[3];
     const bool was_tiled = processed_tensor.layout() == Layout::TILE;
 
-    // The interleaved fold kernels operate on row-major data, so untilize first.
-    if (was_tiled) {
-        processed_tensor = ttnn::to_layout(processed_tensor, Layout::ROW_MAJOR);
-    }
-
+    // Do NOT untilize: MultiCoreDRAMFold has a native tiled branch via TensorAccessor.
     auto output_tensor = ttnn::prim::fold(processed_tensor, stride_h, stride_w);
 
-    // Reshape output if input was tiled
+    // TILE inputs preserve the input 4D shape in the device op; reshape to folded_4d here.
     if (was_tiled) {
         const ttnn::Shape final_shape(
             {batch_size, input_height / stride_h, input_width / stride_w, in_channels * stride_h * stride_w});

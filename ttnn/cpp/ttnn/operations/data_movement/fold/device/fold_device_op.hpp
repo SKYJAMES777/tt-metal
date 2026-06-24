@@ -17,7 +17,8 @@ struct Fold {
     struct operation_attributes_t {
         uint32_t stride_h{};
         uint32_t stride_w{};
-        bool is_sharded{};
+        // Gates the zero-NOC `MultiCore` fast path; everything else routes to MultiCoreDRAMFold.
+        bool is_height_sharded_rm_fast_path{};
     };
 
     struct tensor_args_t {
