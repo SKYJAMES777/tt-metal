@@ -1248,8 +1248,12 @@ class DeepSeekV4HashRouter(DeepSeekV4Module):
     (selected experts carry their renormalised score, the rest are 0) so the same
     dense / preloaded expert compute consumes it.
 
-    The selection mask is built host-side from ``input_ids`` (known at call time)
-    — no on-device gather/scatter is needed since the table is fixed.
+    For the traced decode path the selection is done *fully on device*: the frozen
+    ``tid2eid`` table is materialised once into a dense one-hot expert-mask table
+    ``[vocab, E]`` resident on device, and the per-token selection mask is gathered
+    with :func:`ttnn.embedding` straight from the (on-device) token id — no
+    host-side scatter and no per-step host->device mask copy. The host prefill
+    ``forward`` keeps the simple host scatter.
     """
 
     def __init__(self, config, weights: dict, device: ttnn.MeshDevice, cache: Optional[WeightCache] = None):
@@ -1264,6 +1268,14 @@ class DeepSeekV4HashRouter(DeepSeekV4Module):
         tid = weights["gate.tid2eid"]
         tid = tid() if callable(tid) else tid
         self.tid2eid = tid.long()
+        # Dense one-hot expert-selection table [vocab, E] resident on device: row
+        # ``t`` is the selection mask for token id ``t``. ``ttnn.embedding`` gathers
+        # the per-token mask on device from the (on-device) token id, so the static
+        # decode router needs no host-side scatter / per-step mask copy.
+        vocab = self.tid2eid.shape[0]
+        mask_table = torch.zeros(vocab, self.num_experts, dtype=torch.float32)
+        mask_table.scatter_(1, self.tid2eid, 1.0)
+        self.mask_table = ttnn.from_torch(mask_table, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
 
     def forward(self, x_flat: ttnn.Tensor, input_ids: torch.Tensor) -> ttnn.Tensor:
         """``x_flat`` ``[1,1,T,H]`` and ``input_ids`` torch ``[..]`` (T tokens);
@@ -1273,31 +1285,29 @@ class DeepSeekV4HashRouter(DeepSeekV4Module):
         t = x_flat.shape[2]
         _profile(self.device)
 
-        # Static per-token expert selection -> host one-hot mask [1,1,T,E].
-        eids = self.tid2eid[input_ids.reshape(-1).long()]  # [T, top_k]
-        mask = torch.zeros(t, self.num_experts, dtype=torch.float32)
-        mask.scatter_(1, eids, 1.0)
-        mask_tt = ttnn.from_torch(
-            mask.reshape(1, 1, t, self.num_experts), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+        # Per-token expert selection gathered on device from the one-hot mask table
+        # via ``ttnn.embedding`` (token ids -> dense one-hot mask [1,1,T,E]).
+        ids_tt = ttnn.from_torch(
+            input_ids.reshape(1, t).long().to(torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
         )
+        mask_tt = ttnn.embedding(ids_tt, self.mask_table, layout=ttnn.TILE_LAYOUT)  # [1, T, E]
+        mask_tt = ttnn.reshape(mask_tt, [1, 1, t, self.num_experts])
 
         selected = ttnn.multiply(scores, mask_tt)
         denom = ttnn.add(ttnn.sum(selected, dim=-1, keepdim=True), 1.0e-20)
         return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
 
-    def selection_mask(self, token_id: int) -> torch.Tensor:
-        """Host one-hot expert-selection mask ``[1, 1, 1, E]`` for ``token_id`` —
-        the frozen ``tid2eid`` lookup, built on host (the traced decode writes it
-        into a persistent device input each step)."""
-        eids = self.tid2eid[int(token_id)].reshape(-1).long()
-        mask = torch.zeros(self.num_experts, dtype=torch.float32)
-        mask.scatter_(0, eids, 1.0)
-        return mask.reshape(1, 1, 1, self.num_experts)
-
-    def forward_static(self, x_flat: ttnn.Tensor, mask_tt: ttnn.Tensor) -> ttnn.Tensor:
-        """Trace-safe hash routing: ``mask_tt`` ``[1,1,1,E]`` is the (persistent,
-        per-step) device selection mask from :meth:`selection_mask`; the gate score
-        path stays on device. Returns dense routing weights ``[1,1,1,E]``."""
+    def forward_static(self, x_flat: ttnn.Tensor, token_in: ttnn.Tensor) -> ttnn.Tensor:
+        """Trace-safe, fully on-device hash routing: ``token_in`` ``[1,1]`` is the
+        (persistent, on-device) decode token id. The per-token expert-selection
+        mask is gathered from the on-device ``mask_table`` with :func:`ttnn.embedding`
+        and the gate score path stays on device. Returns dense routing weights
+        ``[1,1,1,E]``."""
+        mask_tt = ttnn.embedding(token_in, self.mask_table, layout=ttnn.TILE_LAYOUT)  # [1, 1, E]
+        mask_tt = ttnn.reshape(mask_tt, [1, 1, 1, self.num_experts])
         logits = self.gate(x_flat)
         scores = ttnn.sqrt(ttnn.softplus(logits))
         selected = ttnn.multiply(scores, mask_tt)
@@ -1596,18 +1606,19 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
 
         return ttnn.add(routed, shared)
 
-    def decode_static(self, hidden: ttnn.Tensor, hash_mask: ttnn.Tensor | None = None) -> ttnn.Tensor:
+    def decode_static(self, hidden: ttnn.Tensor, hash_token: ttnn.Tensor | None = None) -> ttnn.Tensor:
         """Trace-safe single-token MoE. ``hidden`` ``[1, 1, H]`` -> ``[1, 1, H]``.
 
         Routing stays entirely on device: the learned top-k router is already
-        host-sync-free, and hash layers consume the persistent ``hash_mask``
-        ``[1,1,1,E]`` device input (see :meth:`DeepSeekV4HashRouter.forward_static`).
-        The routed FFN runs through the no-host-readback fused-experts decode path.
+        host-sync-free, and hash layers gather their expert-selection mask on device
+        from the persistent ``hash_token`` ``[1,1]`` device token id (see
+        :meth:`DeepSeekV4HashRouter.forward_static`). The routed FFN runs through the
+        no-host-readback fused-experts decode path.
         """
         h = hidden.shape[-1]
         x_flat = ttnn.reshape(hidden, [1, 1, 1, h])
         if self.is_hash:
-            routing_weights = self.gate.forward_static(x_flat, hash_mask)
+            routing_weights = self.gate.forward_static(x_flat, hash_token)
         else:
             routing_weights = self.gate.forward_static(x_flat)
         routed = self.experts.decode_static(x_flat, routing_weights)  # [1, 1, 1, H]
@@ -1921,7 +1932,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         scache: "_StaticLayerCache",
         sliding_pos: ttnn.Tensor,
         compress_pos: ttnn.Tensor,
-        hash_mask: ttnn.Tensor | None = None,
+        hash_token: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         """Trace-safe single-token decode (see :meth:`decode`). Uses the fixed-size
         in-place attention cache + the host-sync-free MoE so the whole block can be
@@ -1941,7 +1952,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         )
         hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
         post, comb, collapsed = self.ffn_hc(hidden_streams)
-        mlp_out = self.mlp.decode_static(self.post_attention_layernorm(collapsed), hash_mask=hash_mask)
+        mlp_out = self.mlp.decode_static(self.post_attention_layernorm(collapsed), hash_token=hash_token)
         return self._mix(post, comb, mlp_out, hidden_streams)
 
 
@@ -2444,7 +2455,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
         }
 
         rd = cfg.qk_rope_head_dim
-        hc, d, e, w = cfg.hc_mult, cfg.hidden_size, cfg.num_local_experts, self.sliding_window
+        hc, d, w = cfg.hc_mult, cfg.hidden_size, self.sliding_window
         num_sm = (self.num_layers + self.layers_per_device - 1) // self.layers_per_device
 
         def _dev_zeros(shape, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
@@ -2468,7 +2479,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 "rope_in": {},
                 "mask_in": {},
                 "win_rope": {},
-                "hash_masks": {},
                 "scaches": {li: self._build_static_layer_cache(li, device) for li in layers_k},
                 "tid": None,
                 "output": None,
@@ -2485,12 +2495,13 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     ttnn.from_torch(cw, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
                     ttnn.from_torch(sw, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
                 )
-            for li in layers_k:
-                if self.layers[li].mlp.is_hash:
-                    sm["hash_masks"][li] = _dev_zeros([1, 1, 1, e], device)
-            if k == 0:
+            # Hash-MoE layers gather their expert mask on device from the token id,
+            # so any submesh holding a hash layer needs the persistent token input
+            # (submesh 0 always has it for the embedding lookup).
+            needs_token = k == 0 or any(self.layers[li].mlp.is_hash for li in layers_k)
+            if needs_token:
                 sm["token_in"] = _dev_zeros([1, 1], device, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
-            else:
+            if k != 0:
                 sm["streams_in"] = _dev_zeros([1, 1, hc, d], device)
             self.submeshes_io.append(sm)
         self._traced_captured = False
@@ -2531,7 +2542,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 sm["scaches"][li],
                 sm["pos_sliding"],
                 sm["pos_compress"],
-                hash_mask=sm["hash_masks"].get(li),
+                hash_token=sm.get("token_in") if layer.mlp.is_hash else None,
             )
         if sm["last"]:
             streams = self.norm(self.hc_head(streams))
@@ -2545,10 +2556,11 @@ class DeepSeekV4Model(DeepSeekV4Module):
             ttnn.experimental.send_direct_async(streams, sender_socket)
         return streams
 
-    def _set_step_inputs(self, token_id: int, pos: int) -> None:
-        """Write the per-step inputs (token id, RoPE rows, masks, cache positions,
-        hash masks) into every submesh's persistent device tensors (allocation-free
-        on device, so it is safe to interleave with ``execute_trace``)."""
+    def _set_step_position_inputs(self, pos: int) -> None:
+        """Write the *position-dependent* per-step inputs (RoPE rows, masks, cache
+        positions) into every submesh's persistent device tensors. These depend
+        only on ``pos`` (a host-side counter), never on a device readback, so they
+        can be refreshed each step without stalling the on-device sampling loop."""
         cfg = self.config
         w = self.sliding_window
         ps = ttnn.from_torch(torch.tensor([pos % w], dtype=torch.int32), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
@@ -2568,18 +2580,20 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     ttnn.copy_host_to_device_tensor(src, dst)
             for lt, dst in sm["mask_in"].items():
                 ttnn.copy_host_to_device_tensor(mask_host[lt], dst)
-            for li, dst in sm["hash_masks"].items():
-                mh = ttnn.from_torch(
-                    self.layers[li].mlp.gate.selection_mask(token_id), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
-                )
-                ttnn.copy_host_to_device_tensor(mh, dst)
-        if self.submeshes_io:
-            ttnn.copy_host_to_device_tensor(
-                ttnn.from_torch(
-                    torch.tensor([[token_id]], dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
-                ),
-                self.submeshes_io[0]["token_in"],
-            )
+
+    def _set_step_inputs(self, token_id: int, pos: int) -> None:
+        """Write the per-step inputs (token id, RoPE rows, masks, cache positions)
+        into every submesh's persistent device tensors (allocation-free on device,
+        so it is safe to interleave with ``execute_trace``). Hash-MoE layers gather
+        their expert mask on device from the token id, so only the token id is
+        written (to every submesh that holds it)."""
+        self._set_step_position_inputs(pos)
+        tok = ttnn.from_torch(
+            torch.tensor([[token_id]], dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
+        )
+        for sm in self.submeshes_io:
+            if "token_in" in sm:
+                ttnn.copy_host_to_device_tensor(tok, sm["token_in"])
 
     def _capture_traces(self) -> None:
         """Capture one trace per submesh: a compile run (to JIT the programs, which
@@ -2639,3 +2653,53 @@ class DeepSeekV4Model(DeepSeekV4Module):
         for sm in self.submeshes_io:
             ttnn.execute_trace(sm["device"], sm["tid"], cq_id=0, blocking=False)
         return self.submeshes_io[-1]["output"]
+
+    def decode_sampled_burst(self, first_token_id: int, start_pos: int, n_steps: int) -> list[int]:
+        """Autoregressively decode ``n_steps`` tokens with greedy (top-1) sampling
+        done *on device*, feeding each sampled token back into the next step without
+        a device->host round trip, then return all ``n_steps`` token ids in a single
+        host transfer.
+
+        Per step (all enqueued on cq0, so ordered without an explicit sync):
+        replay each submesh trace -> ``argmax`` the last submesh's logits ->
+        ``ttnn.copy`` the sampled id back into the first submesh's ``token_in``
+        buffer (the one ``embed_tokens`` reads). Only the position-dependent inputs
+        (RoPE rows / masks / cache positions) are refreshed from the host each step;
+        none of that reads back from device, so the loop never stalls on the device.
+
+        Greedy feedback is fully on-device only when the model lives on a single
+        submesh (the sampled id and ``token_in`` share a device). Hash-MoE layers
+        are supported on device: they gather their expert mask from ``token_in`` with
+        :func:`ttnn.embedding`, which the on-device feedback already refreshes.
+        """
+        if not self.use_submeshes:
+            raise NotImplementedError("traced sampling requires use_submeshes=True")
+        sm0, sm_last = self.submeshes_io[0], self.submeshes_io[-1]
+        if sm0["device"] != sm_last["device"]:
+            raise NotImplementedError(
+                "on-device sampling feedback currently requires a single submesh "
+                "(sampled id and token_in must share a device)"
+            )
+
+        self._set_step_inputs(first_token_id, start_pos)
+        if not self._traced_captured:
+            self._capture_traces()
+
+        token_in = sm0["token_in"]
+        sampled: list[ttnn.Tensor] = []
+        for i in range(n_steps):
+            if i > 0:
+                self._set_step_position_inputs(start_pos + i)  # token comes from device feedback
+            for sm in self.submeshes_io:
+                ttnn.execute_trace(sm["device"], sm["tid"], cq_id=0, blocking=False)
+            logits_rm = ttnn.to_layout(sm_last["output"], ttnn.ROW_MAJOR_LAYOUT)  # [1, 1, vocab]
+            tok = ttnn.argmax(logits_rm, dim=-1, keepdim=True)  # [1, 1, 1]
+            tok = ttnn.reshape(tok, ttnn.Shape([1, 1]))
+            if tok.dtype != ttnn.uint32:
+                tok = ttnn.typecast(tok, ttnn.uint32)
+            sampled.append(tok)
+            ttnn.copy(tok, token_in)  # on-device feedback for the next step
+
+        # One-shot readback: concat all sampled ids and transfer once.
+        all_toks = ttnn.concat(sampled, dim=0)  # [n_steps, 1]
+        return ttnn.to_torch(all_toks).reshape(-1).to(torch.int64).tolist()

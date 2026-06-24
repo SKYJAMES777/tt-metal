@@ -301,3 +301,40 @@ def test_full_model_decode_max_perf(mesh_device, reset_seeds, text: str) -> None
     _sync()  # single host sync after all replays
     dt = time.perf_counter() - t0
     logger.info(f"MAX PERF: {perf_iters / dt:.2f} tok/s ({perf_iters} iters in {dt:.3f}s)")
+
+
+@pytest.mark.skip("Test disabled by default")
+@pytest.mark.timeout(14400)  # heavy: bf4 conversion of every expert + trace capture
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "device_params",
+    [({"fabric_config": ttnn.FabricConfig.FABRIC_2D, "num_command_queues": 2})],
+    indirect=["device_params"],
+    ids=["fabric_2d"],
+)
+@pytest.mark.parametrize("text", (_DEFAULT_TEXT,))
+def test_full_model_decode_on_device_sampling(mesh_device, reset_seeds, text: str) -> None:
+    """Greedy (top-1) sampling done on device, fed back without going to host.
+
+    After prefill, runs a burst of decode steps where each step argmaxes the logits
+    on device and copies the sampled id straight back into the embedding input
+    buffer (no per-step device->host round trip). All sampled token ids are read
+    back to the host in a single transfer at the end.
+    """
+    import time
+
+    n_iters = int(os.environ.get("DEEPSEEK_V4_SAMPLE_ITERS", "25"))
+
+    state = _build_and_prefill(mesh_device, text)
+    model, tokenizer = state["model"], state["tokenizer"]
+    real_len, next_id, traced = state["real_len"], state["next_id"], state["traced"]
+    assert traced, "on-device sampling requires the traced decode path"
+
+    t0 = time.perf_counter()
+    tokens = model.decode_sampled_burst(next_id, real_len, n_iters)  # single host transfer at the end
+    dt = time.perf_counter() - t0
+
+    assert len(tokens) == n_iters
+    logger.info(f"on-device sampling: {n_iters} tokens in {dt:.3f}s ({n_iters / dt:.2f} tok/s)")
+    logger.info(f"SAMPLED IDS : {tokens}")
+    logger.info(f"SAMPLED TEXT: {tokenizer.decode(tokens)!r}")
