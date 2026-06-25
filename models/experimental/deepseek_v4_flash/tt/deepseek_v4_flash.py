@@ -2101,27 +2101,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 socket_config = ttnn.SocketConfig(socket_connections, socket_memconfig)
                 sender_socket, receiver_socket = ttnn.create_socket_pair(from_submesh, to_submesh, socket_config)
                 self.submesh_socket_pairs[(from_id, to_id)] = (sender_socket, receiver_socket)
-            # Wraparound socket: last submesh -> submesh 0 for on-device burst feedback.
-            if num_submeshes > 1:
-                from_submesh = self.submeshes[num_submeshes - 1]
-                to_submesh = self.submeshes[0]
-                socket_connections = []
-                for coord in ttnn.MeshCoordinateRange(from_submesh.shape):
-                    socket_connections.append(
-                        ttnn.SocketConnection(
-                            ttnn.MeshCoreCoord(coord, ttnn.CoreCoord(0, 0)),
-                            ttnn.MeshCoreCoord(coord, ttnn.CoreCoord(0, 0)),
-                        )
-                    )
-                    socket_connections.append(
-                        ttnn.SocketConnection(
-                            ttnn.MeshCoreCoord(coord, ttnn.CoreCoord(0, 1)),
-                            ttnn.MeshCoreCoord(coord, ttnn.CoreCoord(0, 1)),
-                        )
-                    )
-                socket_config = ttnn.SocketConfig(socket_connections, socket_memconfig)
-                sender_socket, receiver_socket = ttnn.create_socket_pair(from_submesh, to_submesh, socket_config)
-                self.submesh_socket_pairs[(num_submeshes - 1, 0)] = (sender_socket, receiver_socket)
         else:
             self.first_device = full_device
             self.last_device = full_device
@@ -2428,7 +2407,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
             )
         return _StaticLayerCache(sliding, ckv, cgate)
 
-    def prepare_static_decode(self, rope: dict, max_seq: int, lm_head=None, *, burst_len: int = 24) -> None:
+    def prepare_static_decode(self, rope: dict, max_seq: int, lm_head=None) -> None:
         """Allocate the traced-decode state (the prompt is prefilled by replaying
         :meth:`decode_traced` once per prompt token into these empty caches).
 
@@ -2477,8 +2456,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
         self._pkt_int_prefix = 3  # [token, pos_sliding, pos_compress]
         self._pkt_w = self._pkt_int_prefix
         self._pkt_rd = rd
-        self._burst_len = burst_len
-        self._last_sm_id = num_sm - 1
 
         # --- On-device RoPE generation constants ------------------------------- #
         # RoPE is ``cos/sin(pos * inv_freq) * attention_scaling`` with ``inv_freq`` /
@@ -2516,7 +2493,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 "mask_gen": {},
                 "scaches": {li: self._build_static_layer_cache(li, device) for li in layers_k},
                 "tid": None,
-                "burst_tid": None,
                 "output": None,
             }
             # Per-family inv_freq constants for the rope families this submesh uses.
@@ -2565,18 +2541,12 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 # The only per-step host-written state: submesh 0's tiny fused packet
                 # (token + positions). Everything downstream is fed over the socket.
                 sm["pkt"] = _dev_zeros([1, 1, 1, self._pkt_w], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-                if num_sm > 1:
-                    sm["pkt_wrap_in"] = _dev_zeros([1, 1, 1, self._pkt_w], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             else:
                 # Receive buffers for the residual streams and the fused packet.
                 sm["streams_in"] = _dev_zeros([1, 1, hc, d], device)
                 sm["pkt_in"] = _dev_zeros([1, 1, 1, self._pkt_w], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-            if sm["last"]:
-                sm["out_buf"] = _dev_zeros([1, 1, 1, burst_len], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-                sm["pkt_wrap_send"] = _dev_zeros([1, 1, 1, self._pkt_w], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             self.submeshes_io.append(sm)
         self._traced_captured = False
-        self._burst_traced_captured = False
 
     def _device_rope(self, inv_freq: ttnn.Tensor, scaling: float, pos_f: ttnn.Tensor) -> tuple:
         """Generate one decode step's RoPE rows on device from the absolute position.
@@ -2611,20 +2581,38 @@ class DeepSeekV4Model(DeepSeekV4Module):
             invalid = ttnn.add(invalid, ttnn.ge(b, thr))  # compressor: window >= completed count
         return ttnn.typecast(ttnn.multiply(invalid, _MASK_NEG), ttnn.bfloat16)
 
-    def _decode_submesh_from_pkt(
-        self, sm: dict, pkt: ttnn.Tensor
-    ) -> tuple[ttnn.Tensor, ttnn.Tensor, ttnn.Tensor, ttnn.Tensor]:
-        """Run one decode step on ``sm`` from the fused input packet.
+    def _decode_submesh_static(self, sm: dict) -> ttnn.Tensor:
+        """Run one submesh's slice of the decode stack over the per-step input
+        packets / in-place caches (shared by the compile run and the trace capture).
 
-        Returns ``(streams, token, sliding_pos, compress_pos)`` where ``streams`` is
-        the post-layer residual (logits if this is the last submesh with ``lm_head``).
-        """
+        The per-step inputs arrive as ONE tiny fused INT32 packet ``[1,1,1,3]`` =
+        ``[token, pos_sliding, pos_compress]``. Submesh 0 reads its single persistent
+        host-written packet buffer directly; every later submesh receives the packet
+        (and the residual streams) over the socket. Each submesh then *splits* the
+        packet on device and generates both the RoPE rows and the additive masks from
+        ``pos_compress`` — and, unless it is the last, forwards the streams and packet
+        unchanged to the next submesh."""
         cfg = self.config
+        k = sm["index"]
+        if sm["first"]:
+            pkt = sm["pkt"]
+        else:
+            # Receive the residual streams and the fused packet from the previous
+            # submesh directly into the persistent buffers. Captured inside this
+            # submesh's trace so the cross-submesh copies need no host-side op
+            # dispatch at replay time. Order must match the sender below.
+            _, receiver_socket = self.submesh_socket_pairs[(k - 1, k)]
+            ttnn.experimental.recv_direct_async(sm["streams_in"], receiver_socket)
+            ttnn.experimental.recv_direct_async(sm["pkt_in"], receiver_socket)
+            pkt = sm["pkt_in"]
 
+        # Split the packet -> token, sliding position [1], compress position [1].
         token = ttnn.typecast(ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 0], [1, 1, 1, 1]), [1, 1]), ttnn.uint32)  # [1,1]
         sliding_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 1], [1, 1, 1, 2]), [1])
         compress_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 2], [1, 1, 1, 3]), [1])
 
+        # Generate the per-step RoPE rows and additive masks on device from the
+        # absolute position (nothing position-dependent is shipped in the packet).
         pos_f = ttnn.typecast(ttnn.to_layout(ttnn.reshape(compress_pos, [1, 1, 1, 1]), ttnn.TILE_LAYOUT), ttnn.float32)
         rope_views: dict[str, tuple] = {}
         for rt, (inv_freq, scaling) in sm["rope_invfreq"].items():
@@ -2668,52 +2656,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
             streams = self.norm(self.hc_head(streams))
             if self._lm_head_traced is not None:
                 streams = self._lm_head_traced(streams)
-        return streams, token, sliding_pos, compress_pos
-
-    def _device_next_packet(
-        self, pkt_out: ttnn.Tensor, token_i32: ttnn.Tensor, compress_pos: ttnn.Tensor
-    ) -> ttnn.Tensor:
-        """Build the next-step fused packet ``[1,1,1,3]`` on device into ``pkt_out``."""
-        w = float(self.sliding_window)
-        new_compress = ttnn.add(compress_pos, 1)
-        pos_f = ttnn.typecast(ttnn.to_layout(ttnn.reshape(new_compress, [1, 1, 1, 1]), ttnn.TILE_LAYOUT), ttnn.float32)
-        new_sliding_f = ttnn.subtract(pos_f, ttnn.multiply(ttnn.floor(ttnn.multiply(pos_f, 1.0 / w)), w))
-        new_sliding = ttnn.reshape(ttnn.typecast(new_sliding_f, ttnn.int32), [1, 1, 1, 1])
-        tok = ttnn.reshape(
-            token_i32 if token_i32.dtype == ttnn.int32 else ttnn.typecast(token_i32, ttnn.int32), [1, 1, 1, 1]
-        )
-        comp = ttnn.reshape(new_compress, [1, 1, 1, 1])
-        ttnn.experimental.slice_write(tok, pkt_out, [0, 0, 0, 0], [1, 1, 1, 1], [1, 1, 1, 1])
-        ttnn.experimental.slice_write(new_sliding, pkt_out, [0, 0, 0, 1], [1, 1, 1, 2], [1, 1, 1, 1])
-        ttnn.experimental.slice_write(comp, pkt_out, [0, 0, 0, 2], [1, 1, 1, 3], [1, 1, 1, 1])
-        return pkt_out
-
-    def _decode_submesh_static(self, sm: dict) -> ttnn.Tensor:
-        """Run one submesh's slice of the decode stack over the per-step input
-        packets / in-place caches (shared by the compile run and the trace capture).
-
-        The per-step inputs arrive as ONE tiny fused INT32 packet ``[1,1,1,3]`` =
-        ``[token, pos_sliding, pos_compress]``. Submesh 0 reads its single persistent
-        host-written packet buffer directly; every later submesh receives the packet
-        (and the residual streams) over the socket. Each submesh then *splits* the
-        packet on device and generates both the RoPE rows and the additive masks from
-        ``pos_compress`` — and, unless it is the last, forwards the streams and packet
-        unchanged to the next submesh."""
-        k = sm["index"]
-        if sm["first"]:
-            pkt = sm["pkt"]
         else:
-            # Receive the residual streams and the fused packet from the previous
-            # submesh directly into the persistent buffers. Captured inside this
-            # submesh's trace so the cross-submesh copies need no host-side op
-            # dispatch at replay time. Order must match the sender below.
-            _, receiver_socket = self.submesh_socket_pairs[(k - 1, k)]
-            ttnn.experimental.recv_direct_async(sm["streams_in"], receiver_socket)
-            ttnn.experimental.recv_direct_async(sm["pkt_in"], receiver_socket)
-            pkt = sm["pkt_in"]
-
-        streams, _, _, _ = self._decode_submesh_from_pkt(sm, pkt)
-        if not sm["last"]:
             # Send the residual streams and the fused packet to the next submesh over
             # the socket pair. Captured inside this submesh's trace, so the
             # cross-submesh copies are dispatched on device at replay time (no host
@@ -2722,65 +2665,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
             ttnn.experimental.send_direct_async(streams, sender_socket)
             ttnn.experimental.send_direct_async(pkt, sender_socket)
         return streams
-
-    def _decode_submesh_burst_step(self, sm: dict, i: int) -> ttnn.Tensor:
-        """One iteration ``i`` of the burst decode loop on ``sm``."""
-        burst_len = self._burst_len
-        k = sm["index"]
-        num_sm = self._last_sm_id + 1
-
-        if sm["first"]:
-            if i == 0:
-                pkt = sm["pkt"]
-            elif num_sm > 1:
-                _, wrap_recv = self.submesh_socket_pairs[(self._last_sm_id, 0)]
-                ttnn.experimental.recv_direct_async(sm["pkt_wrap_in"], wrap_recv)
-                pkt = sm["pkt_wrap_in"]
-            else:
-                pkt = sm["pkt"]
-        else:
-            _, receiver_socket = self.submesh_socket_pairs[(k - 1, k)]
-            ttnn.experimental.recv_direct_async(sm["streams_in"], receiver_socket)
-            ttnn.experimental.recv_direct_async(sm["pkt_in"], receiver_socket)
-            pkt = sm["pkt_in"]
-
-        streams, _, sliding_pos, compress_pos = self._decode_submesh_from_pkt(sm, pkt)
-
-        if sm["last"]:
-            logits_rm = ttnn.to_layout(streams, ttnn.ROW_MAJOR_LAYOUT)
-            tok = ttnn.argmax(logits_rm, dim=-1, keepdim=True)  # [1, 1, 1]
-            tok_i32 = tok if tok.dtype == ttnn.int32 else ttnn.typecast(tok, ttnn.int32)
-            ttnn.experimental.slice_write(
-                ttnn.reshape(tok_i32, [1, 1, 1, 1]),
-                sm["out_buf"],
-                [0, 0, 0, i],
-                [1, 1, 1, i + 1],
-                [1, 1, 1, 1],
-            )
-            if i < burst_len - 1:
-                if num_sm > 1:
-                    next_pkt = self._device_next_packet(sm["pkt_wrap_send"], tok_i32, compress_pos)
-                    wrap_send, _ = self.submesh_socket_pairs[(self._last_sm_id, 0)]
-                    ttnn.experimental.send_direct_async(next_pkt, wrap_send)
-                else:
-                    self._device_next_packet(sm["pkt"], tok_i32, compress_pos)
-        else:
-            sender_socket, _ = self.submesh_socket_pairs[(k, k + 1)]
-            ttnn.experimental.send_direct_async(streams, sender_socket)
-            ttnn.experimental.send_direct_async(pkt, sender_socket)
-        return streams
-
-    def _decode_submesh_burst(self, sm: dict) -> ttnn.Tensor:
-        """Run ``self._burst_len`` decode steps on ``sm``, unrolled inside one trace.
-
-        Submesh 0 reads the host-written packet on step 0 and the wraparound socket on
-        later steps. The last submesh argmax-samples each step, writes the id into
-        ``out_buf`` via ``slice_write``, and (except on the final step) ships the next
-        packet back to submesh 0 over the wraparound socket."""
-        last_out = None
-        for i in range(self._burst_len):
-            last_out = self._decode_submesh_burst_step(sm, i)
-        return last_out
 
     def _build_packet(self, token_id: int, pos: int) -> ttnn.Tensor:
         """Host-build the whole fused packet ``[1,1,1,3]`` as INT32:
@@ -2845,30 +2729,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
             sm["output"] = out  # persistent; overwritten in place by every execute_trace
         self._traced_captured = True
 
-    def _capture_burst_traces(self) -> None:
-        """Capture one ``_burst_len``-step trace per submesh (see :meth:`_capture_traces`)."""
-        compile_outs = []
-        for i in range(self._burst_len):
-            for sm in self.submeshes_io:
-                compile_outs.append(self._decode_submesh_burst_step(sm, i))
-        for out in compile_outs:
-            if out is not None:
-                out.deallocate(True)
-        for sm in self.submeshes_io:
-            device = sm["device"]
-            logger.info(
-                f"[burst-decode] capturing submesh {sm['index']} "
-                f"({len(sm['layers'])} layers, {self._burst_len} steps)"
-            )
-            tid = ttnn.begin_trace_capture(device, cq_id=0)
-            with _trace_capture_guard():
-                out = self._decode_submesh_burst(sm)
-            ttnn.end_trace_capture(device, tid, cq_id=0)
-            sm["burst_tid"] = tid
-            if sm["last"]:
-                sm["burst_output"] = out
-        self._burst_traced_captured = True
-
     def decode_traced(self, token_id: int, pos: int) -> ttnn.Tensor:
         """One traced decode step: feed ``token_id`` at absolute position ``pos``.
 
@@ -2890,35 +2750,6 @@ class DeepSeekV4Model(DeepSeekV4Module):
         for sm in self.submeshes_io:
             ttnn.execute_trace(sm["device"], sm["tid"], cq_id=0, blocking=False)
         return self.submeshes_io[-1]["output"]
-
-    def decode_burst_traced(self, first_token_id: int, start_pos: int) -> list[int]:
-        """Autoregressively decode ``burst_len`` tokens in one traced replay per submesh.
-
-        Only the first step of the burst is seeded from the host (``first_token_id``
-        at ``start_pos``); the remaining steps run as a closed loop on device — the
-        last submesh argmax-samples each step, writes ids into a persistent
-        ``[1,1,1,burst_len]`` output buffer via ``slice_write``, and ships the next
-        packet back to submesh 0 over the wraparound socket. Returns all ``burst_len``
-        sampled ids in a single host readback.
-
-        For fewer than ``burst_len`` tokens (e.g. the tail of generation), use
-        :meth:`decode_traced` instead — the captured burst trace always runs the full
-        ``burst_len`` steps."""
-        if not self.use_submeshes:
-            raise NotImplementedError("burst traced decode requires use_submeshes=True")
-        if self._lm_head_traced is None:
-            raise ValueError("burst traced decode requires lm_head passed to prepare_static_decode")
-
-        n = self._burst_len
-        self._set_step_inputs(first_token_id, start_pos)
-        if not self._burst_traced_captured:
-            self._capture_burst_traces()
-        for sm in self.submeshes_io:
-            ttnn.execute_trace(sm["device"], sm["burst_tid"], cq_id=0, blocking=False)
-
-        sm_last = next(sm for sm in self.submeshes_io if sm["last"])
-        out_slice = ttnn.slice(sm_last["out_buf"], [0, 0, 0, 0], [1, 1, 1, n])
-        return ttnn.to_torch(out_slice).reshape(-1).to(torch.int64).tolist()
 
     def decode_sampled_burst(self, first_token_id: int, start_pos: int, n_steps: int) -> list[int]:
         """Autoregressively decode ``n_steps`` tokens with greedy (top-1) sampling
