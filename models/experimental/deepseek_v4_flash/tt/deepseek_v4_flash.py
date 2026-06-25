@@ -2359,36 +2359,14 @@ class DeepSeekV4Model(DeepSeekV4Module):
     # writes the tiny per-step inputs onto submesh 0 *only*, fused into ONE
     # fixed-shape INT32 packet (token + cache positions + the additive masks carried
     # as float32-bits-as-int32). The per-step RoPE rows are generated on device from
-    # the position (no host build / transport). The streams and packet are
-    # socket-copied between submeshes from inside the traces themselves, where each
-    # submesh splits the packet (bitcasting the mask region back to float32) into the
-    # individual inputs on device (no per-step host op dispatch past submesh 0).
-    # All cross-token state lives in fixed-size in-place caches
-    # (:class:`_StaticLayerCache`) so a single capture serves every step.
+    # the position (no host build / transport), as are the additive attention masks.
+    # The streams and packet are socket-copied between submeshes from inside the
+    # traces themselves, where each submesh splits the packet into the individual
+    # inputs on device (no per-step host op dispatch past submesh 0). All cross-token
+    # state lives in fixed-size in-place caches (:class:`_StaticLayerCache`) so a
+    # single capture serves every step.
     # See :meth:`prepare_static_decode` / :meth:`decode_traced`.
     # ------------------------------------------------------------------ #
-    def _decode_mask_host(
-        self, pos: int, layer_type: str, compress_rate: Optional[int], n_win_cap: int
-    ) -> torch.Tensor:
-        """Host additive decode mask ``[1,1,1,W(+n_win_cap)]`` torch row for
-        ``layer_type`` at ``pos``.
-
-        Sliding cols: a ring slot is valid iff its token has been written and is
-        within the window (``pos+1 >= W`` -> all valid, else slots ``0..pos``).
-        Compressor cols: window ``w`` is valid iff ``w < (pos+1)//compress_rate``
-        (the degenerate-indexer causal block bias). Invalid -> ``_MASK_NEG``.
-        """
-        w = self.sliding_window
-        slots = torch.arange(w)
-        sld_valid = torch.ones(w, dtype=torch.bool) if pos + 1 >= w else (slots <= pos)
-        sld = torch.zeros(w).masked_fill(~sld_valid, _MASK_NEG)
-        if layer_type == "sliding_attention":
-            row = sld
-        else:
-            entries = torch.arange(n_win_cap)
-            win = torch.zeros(n_win_cap).masked_fill(entries >= ((pos + 1) // compress_rate), _MASK_NEG)
-            row = torch.cat([sld, win], dim=0)
-        return row.reshape(1, 1, 1, -1)
 
     def _build_static_layer_cache(self, li: int, device: ttnn.MeshDevice) -> "_StaticLayerCache":
         """Allocate a layer's fixed-size in-place caches *empty* (all-zero).
@@ -2459,38 +2437,24 @@ class DeepSeekV4Model(DeepSeekV4Module):
         num_sm = (self.num_layers + self.layers_per_device - 1) // self.layers_per_device
 
         # --- Canonical per-step input packet layout (shared by every submesh) --- #
-        # All per-step inputs are fused into ONE fixed-shape INT32 packet
-        # ``[1, 1, 1, 3 + Wf]`` (ROW_MAJOR), a single persistent buffer on submesh 0
+        # All per-step inputs are fused into ONE tiny fixed-shape INT32 packet
+        # ``[1, 1, 1, 3]`` (ROW_MAJOR), a single persistent buffer on submesh 0
         # written from host *only* there and then flowed downstream over the existing
         # socket (see :meth:`_decode_submesh_static`), so no submesh past the first
-        # needs a per-step host->device write. The int and float fields share one
-        # int32 buffer by storing the float (mask) values as their raw int32 bit
-        # pattern; each consumer recovers them on device with ``ttnn.bitcast`` to
-        # float32 (a bit-preserving reinterpret, so the integers never have to pass
-        # through a float pipeline that could flush their small-magnitude patterns).
+        # needs a per-step host->device write.
         #
-        #   idx 0   : token (INT32; embedding/hash use it typecast to uint32). Placed
-        #             first so the on-device sampling loop can re-inject the sampled
-        #             id by slicing off idx 0 and re-concatenating (see
-        #             :meth:`decode_sampled_burst`).
-        #   idx 1   : pos_sliding (INT32)
-        #   idx 2   : pos_compress (INT32)
-        #   idx 3.. : every layer type's additive decode mask, concatenated along the
-        #             last dim and stored as float32-bits-as-int32. Each submesh
-        #             slices out, bitcasts to float32 and tilizes only the ranges its
-        #             layers consume. The per-step RoPE rows are *not* in the packet —
-        #             they are generated on device from ``pos_compress`` against the
-        #             constant ``inv_freq`` tables (see :meth:`_device_rope`).
+        #   idx 0 : token (INT32; embedding/hash use it typecast to uint32). Placed
+        #           first so the on-device sampling loop can re-inject the sampled id
+        #           by slicing off idx 0 and re-concatenating (see
+        #           :meth:`decode_sampled_burst`).
+        #   idx 1 : pos_sliding (INT32)
+        #   idx 2 : pos_compress (INT32)
+        #
+        # The per-step RoPE rows and additive masks are *not* in the packet — they are
+        # both generated on device from ``pos_compress`` against constant tables (see
+        # :meth:`_device_rope` and :meth:`_device_mask`).
         self._pkt_int_prefix = 3  # [token, pos_sliding, pos_compress]
-        self._mask_layer_types = sorted({cfg.layer_types[li] for li in range(self.num_layers)})
-        self._pkt_mask: dict[str, tuple[int, int]] = {}
-        off = 0
-        for lt in self._mask_layer_types:
-            width = w if lt == "sliding_attention" else w + self._cr_caps[cfg.compress_rates[lt]][1]
-            self._pkt_mask[lt] = (off, width)
-            off += width
-        self._pkt_float_w = off
-        self._pkt_w = self._pkt_int_prefix + off
+        self._pkt_w = self._pkt_int_prefix
         self._pkt_rd = rd
 
         # --- On-device RoPE generation constants ------------------------------- #
@@ -2526,6 +2490,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 "last": layers_k and layers_k[-1] == self.num_layers - 1,
                 "win_rope": {},
                 "rope_invfreq": {},
+                "mask_gen": {},
                 "scaches": {li: self._build_static_layer_cache(li, device) for li in layers_k},
                 "tid": None,
                 "output": None,
@@ -2537,6 +2502,34 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     ttnn.from_torch(inv_freq_full, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device),
                     scaling,
                 )
+            # Per-layer-type constant index tables for on-device mask generation. The
+            # mask row is ``invalid * _MASK_NEG`` with ``invalid = (A > pos)`` over the
+            # sliding columns OR ``(B >= (pos+1)//cr)`` over the compressor columns;
+            # the two regions are packed into full-width A / B tables with ``-1``
+            # fillers in the *other* region (``-1`` is never ``> pos`` nor ``>= thr``),
+            # so a single compare per table covers each region without a tile-boundary
+            # ``concat``.
+            for lt in types:
+                if lt == "sliding_attention":
+                    a = torch.arange(w, dtype=torch.float32)  # slot index 0..W-1
+                    b = None
+                    cr = None
+                else:
+                    cr = cfg.compress_rates[lt]
+                    n_win_cap = self._cr_caps[cr][1]
+                    a = torch.cat([torch.arange(w), torch.full((n_win_cap,), -1)]).float()
+                    b = torch.cat([torch.full((w,), -1), torch.arange(n_win_cap)]).float()
+                a_tt = ttnn.from_torch(
+                    a.reshape(1, 1, 1, -1), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device
+                )
+                b_tt = (
+                    None
+                    if b is None
+                    else ttnn.from_torch(
+                        b.reshape(1, 1, 1, -1), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device
+                    )
+                )
+                sm["mask_gen"][lt] = (a_tt, b_tt, cr)
             for cr in crs:
                 n_win_cap = self._cr_caps[cr][1]
                 cw, sw = make_rope_table(rope["win"][cr][0][:n_win_cap], rope["win"][cr][1][:n_win_cap])
@@ -2545,9 +2538,8 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     ttnn.from_torch(sw, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
                 )
             if k == 0:
-                # The only per-step host-written state: submesh 0's single fused
-                # packet (token + positions + float-bits region). Everything
-                # downstream is fed over the socket.
+                # The only per-step host-written state: submesh 0's tiny fused packet
+                # (token + positions). Everything downstream is fed over the socket.
                 sm["pkt"] = _dev_zeros([1, 1, 1, self._pkt_w], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             else:
                 # Receive buffers for the residual streams and the fused packet.
@@ -2573,21 +2565,35 @@ class DeepSeekV4Model(DeepSeekV4Module):
         neg_sin = ttnn.typecast(ttnn.neg(sin), ttnn.bfloat16)
         return cos, ttnn.typecast(sin, ttnn.bfloat16), neg_sin
 
+    def _device_mask(
+        self, a: ttnn.Tensor, b: Optional[ttnn.Tensor], cr: Optional[int], pos_f: ttnn.Tensor
+    ) -> ttnn.Tensor:
+        """Generate one decode step's additive attention mask on device from the
+        absolute position. ``a`` / ``b`` are the constant index tables built in
+        :meth:`prepare_static_decode`; the row is ``invalid * _MASK_NEG`` with
+        ``invalid = (a > pos)`` over the sliding columns plus, for CSA/HCA layers,
+        ``(b >= (pos+1)//cr)`` over the compressor columns. The two regions never both
+        fire at a column (the ``-1`` fillers compare false), so the indicators add to
+        a clean 0/1 mask. Returns a bf16 tile ``[1,1,1,W(+n_win_cap)]``."""
+        invalid = ttnn.gt(a, pos_f)  # sliding: slot index > pos  (broadcast over [1,1,1,1])
+        if b is not None:
+            thr = ttnn.floor(ttnn.multiply(ttnn.add(pos_f, 1.0), 1.0 / cr))  # (pos+1)//cr
+            invalid = ttnn.add(invalid, ttnn.ge(b, thr))  # compressor: window >= completed count
+        return ttnn.typecast(ttnn.multiply(invalid, _MASK_NEG), ttnn.bfloat16)
+
     def _decode_submesh_static(self, sm: dict) -> ttnn.Tensor:
         """Run one submesh's slice of the decode stack over the per-step input
         packets / in-place caches (shared by the compile run and the trace capture).
 
-        The per-step inputs arrive as ONE fused INT32 packet ``[1,1,1,3+Wf]``:
-        idx 0..2 are ``[token, pos_sliding, pos_compress]`` and idx 3.. are the
-        per-layer-type masks stored as float32-bits-as-int32. Submesh 0 reads its
-        single persistent host-written packet buffer directly; every later submesh
-        receives the packet (and the residual streams) over the socket. Each submesh
-        then *splits* the packet on device — bitcasting the mask region back to
-        float32 and generating the RoPE rows from ``pos_compress`` — and, unless it
-        is the last, forwards the streams and packet unchanged to the next submesh."""
+        The per-step inputs arrive as ONE tiny fused INT32 packet ``[1,1,1,3]`` =
+        ``[token, pos_sliding, pos_compress]``. Submesh 0 reads its single persistent
+        host-written packet buffer directly; every later submesh receives the packet
+        (and the residual streams) over the socket. Each submesh then *splits* the
+        packet on device and generates both the RoPE rows and the additive masks from
+        ``pos_compress`` — and, unless it is the last, forwards the streams and packet
+        unchanged to the next submesh."""
         cfg = self.config
         k = sm["index"]
-        pre = self._pkt_int_prefix
         if sm["first"]:
             pkt = sm["pkt"]
         else:
@@ -2605,22 +2611,18 @@ class DeepSeekV4Model(DeepSeekV4Module):
         sliding_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 1], [1, 1, 1, 2]), [1])
         compress_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 2], [1, 1, 1, 3]), [1])
 
-        # Generate the per-step RoPE rows on device from the absolute position, and
-        # bitcast + tilize the per-layer-type masks out of the packet's float region.
+        # Generate the per-step RoPE rows and additive masks on device from the
+        # absolute position (nothing position-dependent is shipped in the packet).
         pos_f = ttnn.typecast(ttnn.to_layout(ttnn.reshape(compress_pos, [1, 1, 1, 1]), ttnn.TILE_LAYOUT), ttnn.float32)
         rope_views: dict[str, tuple] = {}
         for rt, (inv_freq, scaling) in sm["rope_invfreq"].items():
             rope_views[rt] = self._device_rope(inv_freq, scaling, pos_f)
 
-        def _view(o: int, width: int) -> ttnn.Tensor:
-            s = ttnn.slice(pkt, [0, 0, 0, pre + o], [1, 1, 1, pre + o + width])
-            return ttnn.typecast(ttnn.bitcast(ttnn.to_layout(s, ttnn.TILE_LAYOUT), ttnn.float32), ttnn.bfloat16)
-
         types = {cfg.layer_types[li] for li in sm["layers"]}
         mask_views: dict[str, ttnn.Tensor] = {}
         for lt in types:
-            o, width = self._pkt_mask[lt]
-            mask_views[lt] = _view(o, width)
+            a, b, cr = sm["mask_gen"][lt]
+            mask_views[lt] = self._device_mask(a, b, cr, pos_f)
 
         if sm["first"]:
             inputs_embeds = self.embed_tokens(token)  # [1, 1, D]
@@ -2665,23 +2667,12 @@ class DeepSeekV4Model(DeepSeekV4Module):
         return streams
 
     def _build_packet(self, token_id: int, pos: int) -> ttnn.Tensor:
-        """Host-build the whole fused packet ``[1,1,1,3+Wf]`` as INT32:
-        ``[token, pos_sliding, pos_compress]`` followed by the float region (every
-        layer type's additive decode mask) stored as its float32 bit pattern viewed
-        as int32, in the canonical order fixed by :meth:`prepare_static_decode`. The
-        on-device :meth:`_decode_submesh_static` bitcasts each sliced float range back
-        to float32. The per-step RoPE rows are *not* in the packet — they are
-        generated on device from ``pos_compress`` (see :meth:`_device_rope`)."""
-        cfg = self.config
+        """Host-build the whole fused packet ``[1,1,1,3]`` as INT32:
+        ``[token, pos_sliding, pos_compress]``. The per-step RoPE rows and additive
+        masks are *not* in the packet — they are generated on device from
+        ``pos_compress`` (see :meth:`_device_rope` / :meth:`_device_mask`)."""
         w = self.sliding_window
-        pieces: list[torch.Tensor] = []
-        for lt in self._mask_layer_types:
-            cr = None if lt == "sliding_attention" else cfg.compress_rates[lt]
-            n_win_cap = self._cr_caps[cr][1] if cr is not None else 0
-            pieces.append(self._decode_mask_host(pos, lt, cr, n_win_cap))
-        floats = torch.cat(pieces, dim=-1).to(torch.float32).contiguous()
-        head = torch.tensor([[[[token_id, pos % w, pos]]]], dtype=torch.int32)  # [1,1,1,3]
-        packet = torch.cat([head, floats.view(torch.int32)], dim=-1)  # [1,1,1,3+Wf]
+        packet = torch.tensor([[[[token_id, pos % w, pos]]]], dtype=torch.int32)  # [1,1,1,3]
         return ttnn.from_torch(packet, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
 
     def _set_step_position_inputs(self, pos: int) -> None:
