@@ -2357,22 +2357,16 @@ class DeepSeekV4Model(DeepSeekV4Module):
     # across submeshes. The traced path captures one ``ttnn`` trace per submesh
     # (so each device replays its own slice of the stack) and, between replays,
     # writes the tiny per-step inputs onto submesh 0 *only*, fused into ONE
-    # fixed-shape INT32 packet (token + cache positions + the RoPE rows / masks
-    # carried as float32-bits-as-int32). The streams and packet are socket-copied
-    # between submeshes from inside the traces themselves, where each submesh splits
-    # the packet (bitcasting the float region back to float32) into the individual
-    # inputs on device (no per-step host op dispatch past submesh 0).
+    # fixed-shape INT32 packet (token + cache positions + the additive masks carried
+    # as float32-bits-as-int32). The per-step RoPE rows are generated on device from
+    # the position (no host build / transport). The streams and packet are
+    # socket-copied between submeshes from inside the traces themselves, where each
+    # submesh splits the packet (bitcasting the mask region back to float32) into the
+    # individual inputs on device (no per-step host op dispatch past submesh 0).
     # All cross-token state lives in fixed-size in-place caches
     # (:class:`_StaticLayerCache`) so a single capture serves every step.
     # See :meth:`prepare_static_decode` / :meth:`decode_traced`.
     # ------------------------------------------------------------------ #
-    def _rope_row_host(self, rope: dict, pos: int, rope_type: str):
-        """Host ``(cos, sin, neg_sin)`` ``[1,1,1,Rd]`` torch RoPE rows at ``pos`` for
-        the ``"main"`` (sliding) or ``"compress"`` (CSA/HCA) family."""
-        cos_h, sin_h = rope["main"] if rope_type == "main" else rope["compress"]
-        cos_full, sin_full = make_rope_table(cos_h[pos : pos + 1], sin_h[pos : pos + 1])
-        return cos_full, sin_full, -sin_full
-
     def _decode_mask_host(
         self, pos: int, layer_type: str, compress_rate: Optional[int], n_win_cap: int
     ) -> torch.Tensor:
@@ -2470,8 +2464,8 @@ class DeepSeekV4Model(DeepSeekV4Module):
         # written from host *only* there and then flowed downstream over the existing
         # socket (see :meth:`_decode_submesh_static`), so no submesh past the first
         # needs a per-step host->device write. The int and float fields share one
-        # int32 buffer by storing the float (RoPE / mask) values as their raw int32
-        # bit pattern; each consumer recovers them on device with ``ttnn.bitcast`` to
+        # int32 buffer by storing the float (mask) values as their raw int32 bit
+        # pattern; each consumer recovers them on device with ``ttnn.bitcast`` to
         # float32 (a bit-preserving reinterpret, so the integers never have to pass
         # through a float pipeline that could flush their small-magnitude patterns).
         #
@@ -2481,19 +2475,16 @@ class DeepSeekV4Model(DeepSeekV4Module):
         #             :meth:`decode_sampled_burst`).
         #   idx 1   : pos_sliding (INT32)
         #   idx 2   : pos_compress (INT32)
-        #   idx 3.. : RoPE rows (cos/sin/neg_sin for "main" then "compress") followed
-        #             by every layer type's additive decode mask, concatenated along
-        #             the last dim and stored as float32-bits-as-int32. Each submesh
+        #   idx 3.. : every layer type's additive decode mask, concatenated along the
+        #             last dim and stored as float32-bits-as-int32. Each submesh
         #             slices out, bitcasts to float32 and tilizes only the ranges its
-        #             layers consume.
+        #             layers consume. The per-step RoPE rows are *not* in the packet —
+        #             they are generated on device from ``pos_compress`` against the
+        #             constant ``inv_freq`` tables (see :meth:`_device_rope`).
         self._pkt_int_prefix = 3  # [token, pos_sliding, pos_compress]
         self._mask_layer_types = sorted({cfg.layer_types[li] for li in range(self.num_layers)})
-        self._pkt_rope: dict[str, int] = {}  # offsets are relative to the float region
-        off = 0
-        for rt in ("main", "compress"):
-            self._pkt_rope[rt] = off
-            off += 3 * rd
         self._pkt_mask: dict[str, tuple[int, int]] = {}
+        off = 0
         for lt in self._mask_layer_types:
             width = w if lt == "sliding_attention" else w + self._cr_caps[cfg.compress_rates[lt]][1]
             self._pkt_mask[lt] = (off, width)
@@ -2501,6 +2492,21 @@ class DeepSeekV4Model(DeepSeekV4Module):
         self._pkt_float_w = off
         self._pkt_w = self._pkt_int_prefix + off
         self._pkt_rd = rd
+
+        # --- On-device RoPE generation constants ------------------------------- #
+        # RoPE is ``cos/sin(pos * inv_freq) * attention_scaling`` with ``inv_freq`` /
+        # ``attention_scaling`` position-independent per family ("main" sliding,
+        # "compress" CSA/HCA). Recover them from the host ``rope`` tables (so the
+        # device output matches them exactly): at p=0 the table is ``scaling`` (sin=0),
+        # and ``inv_freq[j] = atan2(sin_half[1,j], cos_half[1,j])`` (all |inv_freq|<π).
+        # Stored already interleaved-by-2 to match ``make_rope_table``'s expansion.
+        self._rope_gen: dict[str, tuple[torch.Tensor, float]] = {}
+        for rt in ("main", "compress"):
+            cos_h, sin_h = rope[rt]
+            scaling = float(cos_h[0, 0].item())
+            inv_freq_half = torch.atan2(sin_h[1].float(), cos_h[1].float())  # [rd/2]
+            inv_freq_full = inv_freq_half.repeat_interleave(2).reshape(1, 1, 1, -1)  # [1,1,1,rd]
+            self._rope_gen[rt] = (inv_freq_full, scaling)
 
         def _dev_zeros(shape, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
             tt_dtype = {ttnn.bfloat16: torch.float32, ttnn.uint32: torch.int32, ttnn.int32: torch.int32}[dtype]
@@ -2519,10 +2525,18 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 "first": k == 0,
                 "last": layers_k and layers_k[-1] == self.num_layers - 1,
                 "win_rope": {},
+                "rope_invfreq": {},
                 "scaches": {li: self._build_static_layer_cache(li, device) for li in layers_k},
                 "tid": None,
                 "output": None,
             }
+            # Per-family inv_freq constants for the rope families this submesh uses.
+            for rt in ({"main"} if "sliding_attention" in types else set()) | ({"compress"} if crs else set()):
+                inv_freq_full, scaling = self._rope_gen[rt]
+                sm["rope_invfreq"][rt] = (
+                    ttnn.from_torch(inv_freq_full, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device),
+                    scaling,
+                )
             for cr in crs:
                 n_win_cap = self._cr_caps[cr][1]
                 cw, sw = make_rope_table(rope["win"][cr][0][:n_win_cap], rope["win"][cr][1][:n_win_cap])
@@ -2542,21 +2556,37 @@ class DeepSeekV4Model(DeepSeekV4Module):
             self.submeshes_io.append(sm)
         self._traced_captured = False
 
+    def _device_rope(self, inv_freq: ttnn.Tensor, scaling: float, pos_f: ttnn.Tensor) -> tuple:
+        """Generate one decode step's RoPE rows on device from the absolute position.
+
+        ``inv_freq`` ``[1,1,1,Rd]`` (FP32, interleaved-by-2) and ``scaling`` are the
+        constants for one family; ``pos_f`` ``[1,1,1,1]`` (FP32) is the absolute
+        position. Returns ``(cos, sin, neg_sin)`` bf16 tiles equal to the host
+        ``make_rope_table`` rows. The raw angle ``pos * inv_freq`` can reach thousands
+        of radians, so it is range-reduced to ``[0, 2π)`` before ``sin``/``cos`` to
+        keep the device transcendentals accurate."""
+        two_pi = 6.283185307179586
+        angle = ttnn.multiply(inv_freq, pos_f)  # [1,1,1,Rd] (broadcast)
+        angle = ttnn.subtract(angle, ttnn.multiply(ttnn.floor(ttnn.multiply(angle, 1.0 / two_pi)), two_pi))
+        cos = ttnn.typecast(ttnn.multiply(ttnn.cos(angle), scaling), ttnn.bfloat16)
+        sin = ttnn.multiply(ttnn.sin(angle), scaling)
+        neg_sin = ttnn.typecast(ttnn.neg(sin), ttnn.bfloat16)
+        return cos, ttnn.typecast(sin, ttnn.bfloat16), neg_sin
+
     def _decode_submesh_static(self, sm: dict) -> ttnn.Tensor:
         """Run one submesh's slice of the decode stack over the per-step input
         packets / in-place caches (shared by the compile run and the trace capture).
 
         The per-step inputs arrive as ONE fused INT32 packet ``[1,1,1,3+Wf]``:
-        idx 0..2 are ``[token, pos_sliding, pos_compress]`` and idx 3.. are the RoPE
-        rows ++ per-layer-type masks stored as float32-bits-as-int32. Submesh 0 reads
-        its single persistent host-written packet buffer directly; every later
-        submesh receives the packet (and the residual streams) over the socket. Each
-        submesh then *splits* the packet on device — bitcasting the float region back
-        to float32 — and, unless it is the last, forwards the streams and packet
-        unchanged to the next submesh."""
+        idx 0..2 are ``[token, pos_sliding, pos_compress]`` and idx 3.. are the
+        per-layer-type masks stored as float32-bits-as-int32. Submesh 0 reads its
+        single persistent host-written packet buffer directly; every later submesh
+        receives the packet (and the residual streams) over the socket. Each submesh
+        then *splits* the packet on device — bitcasting the mask region back to
+        float32 and generating the RoPE rows from ``pos_compress`` — and, unless it
+        is the last, forwards the streams and packet unchanged to the next submesh."""
         cfg = self.config
         k = sm["index"]
-        rd = self._pkt_rd
         pre = self._pkt_int_prefix
         if sm["first"]:
             pkt = sm["pkt"]
@@ -2575,20 +2605,18 @@ class DeepSeekV4Model(DeepSeekV4Module):
         sliding_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 1], [1, 1, 1, 2]), [1])
         compress_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 2], [1, 1, 1, 3]), [1])
 
-        # Split, bitcast to float32 and tilize only the RoPE rows / masks this
-        # submesh's layers consume. ``_view`` slices the int32 float-region, tilizes,
-        # reinterprets the bits as float32 and casts to the bf16 the kernels expect.
+        # Generate the per-step RoPE rows on device from the absolute position, and
+        # bitcast + tilize the per-layer-type masks out of the packet's float region.
+        pos_f = ttnn.typecast(ttnn.to_layout(ttnn.reshape(compress_pos, [1, 1, 1, 1]), ttnn.TILE_LAYOUT), ttnn.float32)
+        rope_views: dict[str, tuple] = {}
+        for rt, (inv_freq, scaling) in sm["rope_invfreq"].items():
+            rope_views[rt] = self._device_rope(inv_freq, scaling, pos_f)
+
         def _view(o: int, width: int) -> ttnn.Tensor:
             s = ttnn.slice(pkt, [0, 0, 0, pre + o], [1, 1, 1, pre + o + width])
             return ttnn.typecast(ttnn.bitcast(ttnn.to_layout(s, ttnn.TILE_LAYOUT), ttnn.float32), ttnn.bfloat16)
 
         types = {cfg.layer_types[li] for li in sm["layers"]}
-        rope_views: dict[str, tuple] = {}
-        for rt in ({"main"} if "sliding_attention" in types else set()) | (
-            {"compress"} if any(t != "sliding_attention" for t in types) else set()
-        ):
-            o = self._pkt_rope[rt]
-            rope_views[rt] = tuple(_view(o + i * rd, rd) for i in range(3))
         mask_views: dict[str, ttnn.Tensor] = {}
         for lt in types:
             o, width = self._pkt_mask[lt]
@@ -2638,17 +2666,15 @@ class DeepSeekV4Model(DeepSeekV4Module):
 
     def _build_packet(self, token_id: int, pos: int) -> ttnn.Tensor:
         """Host-build the whole fused packet ``[1,1,1,3+Wf]`` as INT32:
-        ``[token, pos_sliding, pos_compress]`` followed by the float region (RoPE
-        rows cos/sin/neg_sin for "main" then "compress", then every layer type's
-        additive decode mask) stored as its float32 bit pattern viewed as int32, in
-        the canonical order fixed by :meth:`prepare_static_decode`. The on-device
-        :meth:`_decode_submesh_static` bitcasts each sliced float range back to
-        float32."""
+        ``[token, pos_sliding, pos_compress]`` followed by the float region (every
+        layer type's additive decode mask) stored as its float32 bit pattern viewed
+        as int32, in the canonical order fixed by :meth:`prepare_static_decode`. The
+        on-device :meth:`_decode_submesh_static` bitcasts each sliced float range back
+        to float32. The per-step RoPE rows are *not* in the packet — they are
+        generated on device from ``pos_compress`` (see :meth:`_device_rope`)."""
         cfg = self.config
         w = self.sliding_window
         pieces: list[torch.Tensor] = []
-        for rt in ("main", "compress"):
-            pieces.extend(self._rope_row_host(self._traced_rope, pos, rt))
         for lt in self._mask_layer_types:
             cr = None if lt == "sliding_attention" else cfg.compress_rates[lt]
             n_win_cap = self._cr_caps[cr][1] if cr is not None else 0
