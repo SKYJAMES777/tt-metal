@@ -2356,11 +2356,12 @@ class DeepSeekV4Model(DeepSeekV4Module):
     # MoE routing weights back to host, and host-copies the residual streams
     # across submeshes. The traced path captures one ``ttnn`` trace per submesh
     # (so each device replays its own slice of the stack) and, between replays,
-    # writes the tiny per-step inputs onto submesh 0 *only*, packed into two
-    # fixed-shape packets (int: token + cache positions; bf16: RoPE rows + masks).
-    # The streams and both packets are socket-copied between submeshes from inside
-    # the traces themselves, where each submesh splits the packets back into the
-    # individual inputs on device (no per-step host op dispatch past submesh 0).
+    # writes the tiny per-step inputs onto submesh 0 *only*, fused into ONE
+    # fixed-shape INT32 packet (token + cache positions + the RoPE rows / masks
+    # carried as float32-bits-as-int32). The streams and packet are socket-copied
+    # between submeshes from inside the traces themselves, where each submesh splits
+    # the packet (bitcasting the float region back to float32) into the individual
+    # inputs on device (no per-step host op dispatch past submesh 0).
     # All cross-token state lives in fixed-size in-place caches
     # (:class:`_StaticLayerCache`) so a single capture serves every step.
     # See :meth:`prepare_static_decode` / :meth:`decode_traced`.
@@ -2440,9 +2441,9 @@ class DeepSeekV4Model(DeepSeekV4Module):
 
         Builds, per submesh: the fixed-size in-place caches (empty / all-zero), the
         constant window-RoPE tables, and the persistent socket recv buffers
-        (residual streams + the two per-step input packets). Submesh 0 additionally
-        gets the only host-written per-step state: the position / token scalars and
-        the bf16 packet. ``max_seq`` must be a multiple of every compress-rate (the caller
+        (residual streams + the single fused per-step input packet). Submesh 0
+        additionally gets the only host-written per-step state: the position / token
+        scalars and the float-bits region. ``max_seq`` must be a multiple of every compress-rate (the caller
         pads it) so each compressor's fixed capacity tiles cleanly into windows.
         ``lm_head`` (optional) is folded into the last submesh's trace so a step
         returns logits directly.
@@ -2464,20 +2465,30 @@ class DeepSeekV4Model(DeepSeekV4Module):
         num_sm = (self.num_layers + self.layers_per_device - 1) // self.layers_per_device
 
         # --- Canonical per-step input packet layout (shared by every submesh) --- #
-        # All position-dependent per-step inputs are packed into two fixed-shape
-        # packets that are written from host onto submesh 0 *only* and then flow
-        # downstream over the existing socket (see :meth:`_decode_submesh_static`),
-        # so no submesh past the first needs a per-step host->device write.
+        # All per-step inputs are fused into ONE fixed-shape INT32 packet
+        # ``[1, 1, 1, 3 + Wf]`` (ROW_MAJOR), a single persistent buffer on submesh 0
+        # written from host *only* there and then flowed downstream over the existing
+        # socket (see :meth:`_decode_submesh_static`), so no submesh past the first
+        # needs a per-step host->device write. The int and float fields share one
+        # int32 buffer by storing the float (RoPE / mask) values as their raw int32
+        # bit pattern; each consumer recovers them on device with ``ttnn.bitcast`` to
+        # float32 (a bit-preserving reinterpret, so the integers never have to pass
+        # through a float pipeline that could flush their small-magnitude patterns).
         #
-        #   * int packet  [1, 3] INT32 ROW_MAJOR : [pos_sliding, pos_compress, token]
-        #     (built on submesh 0 by concatenating its persistent pos / token
-        #     buffers, then split back out on every submesh).
-        #   * bf16 packet [1, 1, 1, W] BF16 ROW_MAJOR : the RoPE rows (cos/sin/neg_sin
-        #     for "main" and "compress") followed by every layer type's additive
-        #     decode mask, concatenated along the last dim. Each submesh slices out
-        #     and tilizes only the ranges its layers consume.
+        #   idx 0   : token (INT32; embedding/hash use it typecast to uint32). Placed
+        #             first so the on-device sampling loop can re-inject the sampled
+        #             id by slicing off idx 0 and re-concatenating (see
+        #             :meth:`decode_sampled_burst`).
+        #   idx 1   : pos_sliding (INT32)
+        #   idx 2   : pos_compress (INT32)
+        #   idx 3.. : RoPE rows (cos/sin/neg_sin for "main" then "compress") followed
+        #             by every layer type's additive decode mask, concatenated along
+        #             the last dim and stored as float32-bits-as-int32. Each submesh
+        #             slices out, bitcasts to float32 and tilizes only the ranges its
+        #             layers consume.
+        self._pkt_int_prefix = 3  # [token, pos_sliding, pos_compress]
         self._mask_layer_types = sorted({cfg.layer_types[li] for li in range(self.num_layers)})
-        self._pkt_rope: dict[str, int] = {}
+        self._pkt_rope: dict[str, int] = {}  # offsets are relative to the float region
         off = 0
         for rt in ("main", "compress"):
             self._pkt_rope[rt] = off
@@ -2487,7 +2498,8 @@ class DeepSeekV4Model(DeepSeekV4Module):
             width = w if lt == "sliding_attention" else w + self._cr_caps[cfg.compress_rates[lt]][1]
             self._pkt_mask[lt] = (off, width)
             off += width
-        self._pkt_bf16_w = off
+        self._pkt_float_w = off
+        self._pkt_w = self._pkt_int_prefix + off
         self._pkt_rd = rd
 
         def _dev_zeros(shape, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
@@ -2519,19 +2531,14 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     ttnn.from_torch(sw, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
                 )
             if k == 0:
-                # The only per-step host-written state: submesh 0's position / token
-                # scalars (concatenated into the int packet on device) and the bf16
-                # packet. Everything downstream is fed over the socket.
-                sm["pos_buf"] = _dev_zeros([1, 2], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-                sm["tok_buf"] = _dev_zeros([1, 1], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-                sm["bf16_pkt"] = _dev_zeros([1, 1, 1, self._pkt_bf16_w], device, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+                # The only per-step host-written state: submesh 0's single fused
+                # packet (token + positions + float-bits region). Everything
+                # downstream is fed over the socket.
+                sm["pkt"] = _dev_zeros([1, 1, 1, self._pkt_w], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             else:
-                # Receive buffers for the residual streams and both packets.
+                # Receive buffers for the residual streams and the fused packet.
                 sm["streams_in"] = _dev_zeros([1, 1, hc, d], device)
-                sm["int_pkt_in"] = _dev_zeros([1, 3], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-                sm["bf16_pkt_in"] = _dev_zeros(
-                    [1, 1, 1, self._pkt_bf16_w], device, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT
-                )
+                sm["pkt_in"] = _dev_zeros([1, 1, 1, self._pkt_w], device, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             self.submeshes_io.append(sm)
         self._traced_captured = False
 
@@ -2539,56 +2546,53 @@ class DeepSeekV4Model(DeepSeekV4Module):
         """Run one submesh's slice of the decode stack over the per-step input
         packets / in-place caches (shared by the compile run and the trace capture).
 
-        The per-step inputs arrive as two packets (int: ``[pos_sliding,
-        pos_compress, token]``; bf16: RoPE rows ++ per-layer-type masks). Submesh 0
-        builds the int packet on device by concatenating its host-written position /
-        token buffers; every later submesh receives both packets (and the residual
-        streams) over the socket. Each submesh then *splits* the packets on device
-        to recover the individual inputs, and — unless it is the last — forwards the
-        streams and both packets unchanged to the next submesh."""
+        The per-step inputs arrive as ONE fused INT32 packet ``[1,1,1,3+Wf]``:
+        idx 0..2 are ``[token, pos_sliding, pos_compress]`` and idx 3.. are the RoPE
+        rows ++ per-layer-type masks stored as float32-bits-as-int32. Submesh 0 reads
+        its single persistent host-written packet buffer directly; every later
+        submesh receives the packet (and the residual streams) over the socket. Each
+        submesh then *splits* the packet on device — bitcasting the float region back
+        to float32 — and, unless it is the last, forwards the streams and packet
+        unchanged to the next submesh."""
         cfg = self.config
         k = sm["index"]
         rd = self._pkt_rd
+        pre = self._pkt_int_prefix
         if sm["first"]:
-            # Concat the position + token scalars into the single int packet, then
-            # split it straight back out (so the on-device representation matches
-            # what downstream submeshes receive and split).
-            int_pkt = ttnn.concat([sm["pos_buf"], sm["tok_buf"]], dim=-1)  # [1, 3]
-            bf16_pkt = sm["bf16_pkt"]
+            pkt = sm["pkt"]
         else:
-            # Receive the residual streams and both input packets from the previous
+            # Receive the residual streams and the fused packet from the previous
             # submesh directly into the persistent buffers. Captured inside this
             # submesh's trace so the cross-submesh copies need no host-side op
             # dispatch at replay time. Order must match the sender below.
             _, receiver_socket = self.submesh_socket_pairs[(k - 1, k)]
             ttnn.experimental.recv_direct_async(sm["streams_in"], receiver_socket)
-            ttnn.experimental.recv_direct_async(sm["int_pkt_in"], receiver_socket)
-            ttnn.experimental.recv_direct_async(sm["bf16_pkt_in"], receiver_socket)
-            int_pkt = sm["int_pkt_in"]
-            bf16_pkt = sm["bf16_pkt_in"]
+            ttnn.experimental.recv_direct_async(sm["pkt_in"], receiver_socket)
+            pkt = sm["pkt_in"]
 
-        # Split the int packet -> sliding position [1], compress position [1], token.
-        sliding_pos = ttnn.reshape(ttnn.slice(int_pkt, [0, 0], [1, 1]), [1])
-        compress_pos = ttnn.reshape(ttnn.slice(int_pkt, [0, 1], [1, 2]), [1])
-        token = ttnn.typecast(ttnn.slice(int_pkt, [0, 2], [1, 3]), ttnn.uint32)  # [1, 1]
+        # Split the packet -> token, sliding position [1], compress position [1].
+        token = ttnn.typecast(ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 0], [1, 1, 1, 1]), [1, 1]), ttnn.uint32)  # [1,1]
+        sliding_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 1], [1, 1, 1, 2]), [1])
+        compress_pos = ttnn.reshape(ttnn.slice(pkt, [0, 0, 0, 2], [1, 1, 1, 3]), [1])
 
-        # Split + tilize only the RoPE rows / masks this submesh's layers consume.
+        # Split, bitcast to float32 and tilize only the RoPE rows / masks this
+        # submesh's layers consume. ``_view`` slices the int32 float-region, tilizes,
+        # reinterprets the bits as float32 and casts to the bf16 the kernels expect.
+        def _view(o: int, width: int) -> ttnn.Tensor:
+            s = ttnn.slice(pkt, [0, 0, 0, pre + o], [1, 1, 1, pre + o + width])
+            return ttnn.typecast(ttnn.bitcast(ttnn.to_layout(s, ttnn.TILE_LAYOUT), ttnn.float32), ttnn.bfloat16)
+
         types = {cfg.layer_types[li] for li in sm["layers"]}
         rope_views: dict[str, tuple] = {}
         for rt in ({"main"} if "sliding_attention" in types else set()) | (
             {"compress"} if any(t != "sliding_attention" for t in types) else set()
         ):
             o = self._pkt_rope[rt]
-            rope_views[rt] = tuple(
-                ttnn.to_layout(
-                    ttnn.slice(bf16_pkt, [0, 0, 0, o + i * rd], [1, 1, 1, o + (i + 1) * rd]), ttnn.TILE_LAYOUT
-                )
-                for i in range(3)
-            )
+            rope_views[rt] = tuple(_view(o + i * rd, rd) for i in range(3))
         mask_views: dict[str, ttnn.Tensor] = {}
         for lt in types:
             o, width = self._pkt_mask[lt]
-            mask_views[lt] = ttnn.to_layout(ttnn.slice(bf16_pkt, [0, 0, 0, o], [1, 1, 1, o + width]), ttnn.TILE_LAYOUT)
+            mask_views[lt] = _view(o, width)
 
         if sm["first"]:
             inputs_embeds = self.embed_tokens(token)  # [1, 1, D]
@@ -2623,22 +2627,25 @@ class DeepSeekV4Model(DeepSeekV4Module):
             if self._lm_head_traced is not None:
                 streams = self._lm_head_traced(streams)
         else:
-            # Send the residual streams and both input packets to the next submesh
-            # over the socket pair. Captured inside this submesh's trace, so the
+            # Send the residual streams and the fused packet to the next submesh over
+            # the socket pair. Captured inside this submesh's trace, so the
             # cross-submesh copies are dispatched on device at replay time (no host
             # round-trip). Order must match the receiver above.
             sender_socket, _ = self.submesh_socket_pairs[(k, k + 1)]
             ttnn.experimental.send_direct_async(streams, sender_socket)
-            ttnn.experimental.send_direct_async(int_pkt, sender_socket)
-            ttnn.experimental.send_direct_async(bf16_pkt, sender_socket)
+            ttnn.experimental.send_direct_async(pkt, sender_socket)
         return streams
 
-    def _build_bf16_packet(self, pos: int) -> ttnn.Tensor:
-        """Host-build the bf16 per-step packet ``[1,1,1,W]`` (ROW_MAJOR): the RoPE
-        rows (cos/sin/neg_sin for "main" then "compress") followed by every layer
-        type's additive decode mask, concatenated along the last dim in the
-        canonical order fixed by :meth:`prepare_static_decode`."""
+    def _build_packet(self, token_id: int, pos: int) -> ttnn.Tensor:
+        """Host-build the whole fused packet ``[1,1,1,3+Wf]`` as INT32:
+        ``[token, pos_sliding, pos_compress]`` followed by the float region (RoPE
+        rows cos/sin/neg_sin for "main" then "compress", then every layer type's
+        additive decode mask) stored as its float32 bit pattern viewed as int32, in
+        the canonical order fixed by :meth:`prepare_static_decode`. The on-device
+        :meth:`_decode_submesh_static` bitcasts each sliced float range back to
+        float32."""
         cfg = self.config
+        w = self.sliding_window
         pieces: list[torch.Tensor] = []
         for rt in ("main", "compress"):
             pieces.extend(self._rope_row_host(self._traced_rope, pos, rt))
@@ -2646,34 +2653,27 @@ class DeepSeekV4Model(DeepSeekV4Module):
             cr = None if lt == "sliding_attention" else cfg.compress_rates[lt]
             n_win_cap = self._cr_caps[cr][1] if cr is not None else 0
             pieces.append(self._decode_mask_host(pos, lt, cr, n_win_cap))
-        packet = torch.cat(pieces, dim=-1)
-        return ttnn.from_torch(packet, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+        floats = torch.cat(pieces, dim=-1).to(torch.float32).contiguous()
+        head = torch.tensor([[[[token_id, pos % w, pos]]]], dtype=torch.int32)  # [1,1,1,3]
+        packet = torch.cat([head, floats.view(torch.int32)], dim=-1)  # [1,1,1,3+Wf]
+        return ttnn.from_torch(packet, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
 
     def _set_step_position_inputs(self, pos: int) -> None:
-        """Write the *position-dependent* per-step inputs (RoPE rows, masks, cache
-        positions) onto submesh 0 *only*, as the position scalars + the bf16 packet.
-        They depend only on ``pos`` (a host-side counter), never on a device
-        readback, and flow downstream over the socket — so the on-device sampling
-        loop never stalls and no later submesh needs a per-step host write."""
-        w = self.sliding_window
-        sm0 = self.submeshes_io[0]
-        pos_t = torch.tensor([[pos % w, pos]], dtype=torch.int32)  # [1, 2]
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(pos_t, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT), sm0["pos_buf"]
-        )
-        ttnn.copy_host_to_device_tensor(self._build_bf16_packet(pos), sm0["bf16_pkt"])
+        """Refresh the *position-dependent* per-step inputs (RoPE rows, masks, cache
+        positions) on submesh 0 *only* by rewriting the whole fused packet with a
+        placeholder token (``0`` at idx 0). They depend only on ``pos`` (a host-side
+        counter), never on a device readback, and flow downstream over the socket.
+        The on-device sampling loop overwrites the placeholder token with the sampled
+        id (see :meth:`decode_sampled_burst`), so the loop never stalls on device."""
+        ttnn.copy_host_to_device_tensor(self._build_packet(0, pos), self.submeshes_io[0]["pkt"])
 
     def _set_step_inputs(self, token_id: int, pos: int) -> None:
-        """Write the per-step inputs (token id, RoPE rows, masks, cache positions)
-        onto submesh 0 *only* (allocation-free on device, so it is safe to interleave
-        with ``execute_trace``). The token / positions are concatenated into the int
-        packet on device and, with the bf16 packet, propagated to the rest of the
-        stack over the socket (so hash-MoE layers on any submesh see the token)."""
-        self._set_step_position_inputs(pos)
-        tok = ttnn.from_torch(
-            torch.tensor([[token_id]], dtype=torch.int32), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT
-        )
-        ttnn.copy_host_to_device_tensor(tok, self.submeshes_io[0]["tok_buf"])
+        """Write all per-step inputs (token id, RoPE rows, masks, cache positions) as
+        the single fused packet onto submesh 0 *only* (allocation-free on device, so
+        it is safe to interleave with ``execute_trace``). The packet is propagated to
+        the rest of the stack over the socket (so hash-MoE layers on any submesh see
+        the token)."""
+        ttnn.copy_host_to_device_tensor(self._build_packet(token_id, pos), self.submeshes_io[0]["pkt"])
 
     def _capture_traces(self) -> None:
         """Capture one trace per submesh: a compile run (to JIT the programs, which
@@ -2741,15 +2741,15 @@ class DeepSeekV4Model(DeepSeekV4Module):
         host transfer.
 
         Per step (all enqueued on cq0, so ordered without an explicit sync):
-        replay each submesh trace -> ``argmax`` the last submesh's logits ->
-        ``ttnn.copy`` the sampled id back into the first submesh's ``token_in``
-        buffer (the one ``embed_tokens`` reads). Only the position-dependent inputs
-        (RoPE rows / masks / cache positions) are refreshed from the host each step;
-        none of that reads back from device, so the loop never stalls on the device.
+        replay each submesh trace -> ``argmax`` the last submesh's logits -> re-inject
+        the sampled id into idx 0 of the first submesh's fused ``pkt`` buffer (the one
+        ``embed_tokens`` reads). Only the position-dependent inputs (RoPE rows / masks
+        / cache positions) are refreshed from the host each step; none of that reads
+        back from device, so the loop never stalls on the device.
 
         Greedy feedback is fully on-device only when the model lives on a single
-        submesh (the sampled id and ``token_in`` share a device). Hash-MoE layers
-        are supported on device: they gather their expert mask from ``token_in`` with
+        submesh (the sampled id and ``pkt`` share a device). Hash-MoE layers are
+        supported on device: they gather their expert mask from the packet token with
         :func:`ttnn.embedding`, which the on-device feedback already refreshes.
         """
         if not self.use_submeshes:
@@ -2765,21 +2765,28 @@ class DeepSeekV4Model(DeepSeekV4Module):
         if not self._traced_captured:
             self._capture_traces()
 
-        tok_buf = sm0["tok_buf"]
+        pkt = sm0["pkt"]
+        w = self._pkt_w
         sampled: list[ttnn.Tensor] = []
+        tok_i32: ttnn.Tensor | None = None
         for i in range(n_steps):
             if i > 0:
-                self._set_step_position_inputs(start_pos + i)  # token comes from device feedback
+                # Refresh positions / RoPE / masks (token slot reset to a placeholder)
+                # then re-inject the previous step's device-sampled id into idx 0 of
+                # the fused packet: slice off the placeholder token and re-concatenate
+                # the real one, copied back in place. All eager (outside the trace).
+                self._set_step_position_inputs(start_pos + i)
+                rest = ttnn.slice(pkt, [0, 0, 0, 1], [1, 1, 1, w])  # everything past the token slot
+                fused = ttnn.concat([ttnn.reshape(tok_i32, ttnn.Shape([1, 1, 1, 1])), rest], dim=-1)
+                ttnn.copy(fused, pkt)
             for sm in self.submeshes_io:
                 ttnn.execute_trace(sm["device"], sm["tid"], cq_id=0, blocking=False)
             logits_rm = ttnn.to_layout(sm_last["output"], ttnn.ROW_MAJOR_LAYOUT)  # [1, 1, vocab]
             tok = ttnn.argmax(logits_rm, dim=-1, keepdim=True)  # [1, 1, 1]
-            tok = ttnn.reshape(tok, ttnn.Shape([1, 1]))
-            sampled.append(tok if tok.dtype == ttnn.uint32 else ttnn.typecast(tok, ttnn.uint32))
-            # On-device feedback for the next step: the int packet is rebuilt inside
-            # submesh 0's trace by concatenating ``pos_buf`` + ``tok_buf``, so writing
-            # the sampled id (as int32) into ``tok_buf`` suffices.
-            ttnn.copy(tok if tok.dtype == ttnn.int32 else ttnn.typecast(tok, ttnn.int32), tok_buf)
+            sampled.append(
+                ttnn.reshape(tok if tok.dtype == ttnn.uint32 else ttnn.typecast(tok, ttnn.uint32), ttnn.Shape([1, 1]))
+            )
+            tok_i32 = tok if tok.dtype == ttnn.int32 else ttnn.typecast(tok, ttnn.int32)
 
         # One-shot readback: concat all sampled ids and transfer once.
         all_toks = ttnn.concat(sampled, dim=0)  # [n_steps, 1]
