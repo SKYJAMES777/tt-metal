@@ -130,6 +130,7 @@ def _build_and_prefill(mesh_device, text: str):
     max_layers = min(
         int(os.environ.get("DEEPSEEK_V4_DECODE_LAYERS", config.num_hidden_layers)), config.num_hidden_layers
     )
+    burst_len = int(os.environ.get("DEEPSEEK_V4_BURST_LEN", "24"))
     top_cache = WeightCache(os.path.join(_CACHE_DIR, "full_decode", "ttnn")) if _CACHE_DIR else None
 
     # --- build the full model + lm_head once -------------------------------- #
@@ -157,8 +158,11 @@ def _build_and_prefill(mesh_device, text: str):
     # prompt token give the first generated token. The fixed-size traced caches
     # are allocated empty here (lm_head folded into the last submesh's trace).
     if traced:
-        model.prepare_static_decode(rope, max_seq, lm_head=lm_head)
-        logger.info("traced decode: prepared empty static buffers; trace captured on first prefill step")
+        model.prepare_static_decode(rope, max_seq, lm_head=lm_head, burst_len=burst_len)
+        logger.info(
+            f"traced decode: prepared empty static buffers (burst_len={burst_len}); "
+            "trace captured on first prefill step"
+        )
     else:
         model.reset_caches()
 
@@ -186,6 +190,7 @@ def _build_and_prefill(mesh_device, text: str):
         "eos_id": config.eos_token_id,
         "next_id": next_id,
         "traced": traced,
+        "burst_len": burst_len,
     }
 
 
@@ -206,14 +211,16 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
     model, lm_head, tokenizer = state["model"], state["lm_head"], state["tokenizer"]
     rope, prompt_ids, real_len = state["rope"], state["prompt_ids"], state["real_len"]
     max_seq, max_new_tokens, eos_id = state["max_seq"], state["max_new_tokens"], state["eos_id"]
-    traced, next_id = state["traced"], state["next_id"]
+    traced, next_id, burst_len = state["traced"], state["next_id"], state["burst_len"]
     generated: list[int] = [next_id]
 
-    # Each step feeds the previously generated token at its absolute position and
-    # reads back the single-token logits (no recompute over the prior context).
+    # Each burst feeds the last generated token at its absolute position and reads
+    # back up to ``burst_len`` sampled ids in one host transfer.
     decode_tokens = 0
     decode_time = 0.0
-    for step in range(1, max_new_tokens):
+    step = 1
+    run = True
+    while step < max_new_tokens and run:
         if next_id == eos_id:
             logger.info("hit EOS; stopping")
             break
@@ -221,27 +228,51 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
         if pos >= max_seq:  # ran past the precomputed RoPE span
             logger.warning(f"hit max RoPE length {max_seq}; stopping at {len(generated)} tokens")
             break
+        n_burst = min(burst_len, max_new_tokens - step, max_seq - pos)
         t0 = time.perf_counter()
         if traced:
-            logits_tt = model.decode_traced(next_id, pos)  # [1, 1, vocab] (lm_head in-trace)
-            logits = ttnn.to_torch(logits_tt).reshape(1, -1).float()  # forces device sync
+            if n_burst == burst_len:
+                burst_tokens = model.decode_burst_traced(next_id, pos)
+            else:
+                burst_tokens = []
+                tok_in = next_id
+                for i in range(n_burst):
+                    logits_tt = model.decode_traced(tok_in, pos + i)
+                    logits = ttnn.to_torch(logits_tt).reshape(1, -1).float()
+                    tok_in = int(logits[0].argmax().item())
+                    burst_tokens.append(tok_in)
         else:
-            hidden = model.decode(next_id, pos, rope)  # [1, 1, D]
-            logits = ttnn.to_torch(lm_head(hidden)).reshape(1, -1).float()  # forces device sync
-        next_id = int(logits[0].argmax().item())
+            burst_tokens = []
+            tok_in = next_id
+            for i in range(n_burst):
+                hidden = model.decode(tok_in, pos + i, rope)  # [1, 1, D]
+                logits = ttnn.to_torch(lm_head(hidden)).reshape(1, -1).float()
+                tok_in = int(logits[0].argmax().item())
+                burst_tokens.append(tok_in)
         decode_time += time.perf_counter() - t0
-        decode_tokens += 1
-        generated.append(next_id)
-        logger.info(f"step {step:3d} (pos {pos:4d}): token id {next_id} {tokenizer.decode([next_id])!r}")
+        for tok in burst_tokens:
+            generated.append(tok)
+            decode_tokens += 1
+            step += 1
+            logger.info(
+                f"step {step - 1:3d} (pos {real_len + step - 2:4d}): token id {tok} {tokenizer.decode([tok])!r}"
+            )
+            if tok == eos_id:
+                logger.info("hit EOS; stopping")
+                run = False
+                break
+        if burst_tokens:
+            next_id = burst_tokens[-1]
+        if next_id == eos_id:
+            break
 
         # Running decode throughput, reported every 10 generated tokens.
-        if decode_tokens % 10 == 0:
-            logger.info(
-                f"decode throughput: {decode_tokens / decode_time:.2f} tok/s "
-                f"({decode_tokens} tokens in {decode_time:.2f}s)"
-            )
-            decode_tokens = 0
-            decode_time = 0.0
+        logger.info(
+            f"decode throughput: {decode_tokens / decode_time:.2f} tok/s "
+            f"({decode_tokens} tokens in {decode_time:.2f}s)"
+        )
+        decode_tokens = 0
+        decode_time = 0.0
 
     if decode_tokens:
         logger.info(
