@@ -9,6 +9,7 @@
 // host passes PCIE_NOC_X/Y so the kernel can compute the correct NOC1 encoding.
 
 #include <cstdint>
+#include "internal/risc_attribs.h"
 #include "risc_common.h"
 #include "api/dataflow/dataflow_api.h"
 #include "api/socket_api.h"
@@ -44,20 +45,14 @@ constexpr uint64_t pcie_noc_xy_full =
 constexpr uint32_t pcie_xy_enc_noc1 = static_cast<uint32_t>(pcie_noc_xy_full >> 32);
 #endif
 
-// Push one ring buffer entry to the host via PCIe D2H socket
-__attribute__((noinline)) void push_entry_to_host(
-    SocketSenderInterface& sock,
+// Issue the PCIe write for one ring buffer entry
+FORCE_INLINE void write_entry_async(
     uint32_t slot_addr,
     uint32_t pcie_xy_enc,
     uint32_t data_addr_hi,
     uint32_t& host_write_ptr,
     uint32_t host_fifo_start,
     uint32_t fifo_page_aligned_size) {
-    noc_write_init_state<write_cmd_buf>(noc_index, NOC_UNICAST_WRITE_VC);
-    RT_PROF_NCRISC_DBG_INC(ring_buffer, socket_reserve_pages_enter_count);
-    socket_reserve_pages(sock, 1);
-    RT_PROF_NCRISC_DBG_INC(ring_buffer, socket_reserve_pages_exit_count);
-
     uint64_t pcie_dest_addr = (static_cast<uint64_t>(data_addr_hi) << 32) | static_cast<uint64_t>(host_write_ptr);
 
     noc_wwrite_with_state<noc_mode, write_cmd_buf, CQ_NOC_SNDL, CQ_NOC_SEND, CQ_NOC_WAIT, true, false>(
@@ -67,12 +62,6 @@ __attribute__((noinline)) void push_entry_to_host(
     if (host_write_ptr >= host_fifo_start + fifo_page_aligned_size) {
         host_write_ptr = host_fifo_start;
     }
-
-    socket_push_pages(sock, 1);
-    socket_notify_receiver(sock);
-
-    noc_async_write_barrier();
-    RT_PROF_NCRISC_DBG_INC(ring_buffer, push_write_barrier_exit_count);
 }
 
 void kernel_main() {
@@ -128,7 +117,9 @@ void kernel_main() {
         loop_count++;
         RT_PROF_NCRISC_DBG_SET(ring_buffer, loop_iteration, loop_count);
 
-        if (rt_ring_empty(ring_buffer)) {
+        const uint32_t read_index = ring_buffer->read_index;
+        const uint32_t write_index = ring_buffer->write_index;
+        if (write_index == read_index) {
             if (ring_buffer->terminate) {
                 return;
             }
@@ -136,17 +127,26 @@ void kernel_main() {
         }
 
         RT_PROF_NCRISC_DBG_SET(ring_buffer, stage, RT_PROFILER_NCRISC_STAGE_PUSHING);
-        uint32_t slot_addr = rt_ring_data_addr(ring_buffer, ring_buffer->read_index);
-        push_entry_to_host(
-            profiler_socket,
-            slot_addr,
-            pcie_xy_enc,
-            data_addr_hi,
-            host_write_ptr,
-            host_fifo_start,
-            fifo_page_aligned_size);
-        ring_buffer->read_index++;
-        push_count++;
+        const uint32_t available = write_index - read_index;
+        RT_PROF_NCRISC_DBG_INC(ring_buffer, socket_reserve_pages_enter_count);
+        socket_reserve_pages(profiler_socket, available);
+        RT_PROF_NCRISC_DBG_INC(ring_buffer, socket_reserve_pages_exit_count);
+        noc_write_init_state<write_cmd_buf>(noc_index, NOC_UNICAST_WRITE_VC);
+        for (uint32_t i = 0; i < available; i++) {
+            write_entry_async(
+                rt_ring_data_addr(ring_buffer, read_index + i),
+                pcie_xy_enc,
+                data_addr_hi,
+                host_write_ptr,
+                host_fifo_start,
+                fifo_page_aligned_size);
+        }
+        socket_push_pages(profiler_socket, available);
+        socket_notify_receiver(profiler_socket);
+        noc_async_write_barrier();
+        RT_PROF_NCRISC_DBG_INC(ring_buffer, push_write_barrier_exit_count);
+        ring_buffer->read_index = read_index + available;
+        push_count += available;
         RT_PROF_NCRISC_DBG_SET(ring_buffer, push_count, push_count);
         RT_PROF_NCRISC_DBG_SET(ring_buffer, stage, RT_PROFILER_NCRISC_STAGE_MAIN_LOOP);
     }

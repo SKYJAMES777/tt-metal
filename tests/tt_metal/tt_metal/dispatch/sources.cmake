@@ -24,6 +24,7 @@ set(UNIT_TESTS_DISPATCH_BASIC_SOURCES
     dispatch_program/test_realtime_profiler_sanity.cpp
     dispatch_program/test_realtime_profiler_stress.cpp
     dispatch_trace/test_sub_device.cpp
+    dispatch_util/test_broadcast_ring.cpp
     dispatch_util/test_ringbuffer_cache.cpp
 )
 
