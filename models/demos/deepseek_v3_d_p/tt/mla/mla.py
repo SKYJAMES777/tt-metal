@@ -618,8 +618,8 @@ class ttMLA:
             # on_layer_complete hands this layer's KV to the migration worker, which reads the cache
             # over NoC out-of-band from the ttnn command queue. Flush the (async) zero op to device
             # first, else the worker can copy pre-zero (stale pad) data.
-            ttnn.synchronize_device(self.mesh_device)
-            on_layer_complete(self.layer_idx)
+            # ttnn.synchronize_device(self.mesh_device)
+            # on_layer_complete(self.layer_idx)
 
         # K and V are the single latent kvpe cache (V = first kv_lora_rank columns, materialized
         # in-op). logical_n = prior valid length + this chunk; cache_batch_idx selects this
@@ -1016,8 +1016,8 @@ class ttMLA:
                 chunk_size_global,
                 self.sp_axis,
             )
-            ttnn.synchronize_device(self.mesh_device)
-            on_layer_complete(self.layer_idx)
+            # ttnn.synchronize_device(self.mesh_device)
+            # on_layer_complete(self.layer_idx)
 
         signpost(header="MLA_END")
         return None

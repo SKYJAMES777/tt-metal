@@ -120,6 +120,7 @@ class TtPrefillTransformer(LightweightModule):
         max_seq_len: Optional[int] = None,
         kv_only_last_layer: bool = False,
         routing_use_l1_small_for_semaphores: bool = False,
+        overlap_shared_expert_with_dispatch: bool = True,
     ):
         super().__init__()
         self.mesh_device = mesh_device
@@ -181,6 +182,7 @@ class TtPrefillTransformer(LightweightModule):
                 max_seq_len=max_seq_len,
                 kv_only=kv_only_last_layer and is_last,
                 routing_use_l1_small_for_semaphores=routing_use_l1_small_for_semaphores,
+                overlap_shared_expert_with_dispatch=overlap_shared_expert_with_dispatch,
             )
             self.layers.append(layer)
 
@@ -230,6 +232,21 @@ class TtPrefillTransformer(LightweightModule):
         self.chunk_order = create_balanced_chunk_order(mesh_device.shape[sp_axis]) if is_balanced else None
 
         logger.info(f"TtPrefillTransformer construction complete ({num_layers} layers)")
+
+    def set_trace_controller(self, controller):
+        """Attach (or clear with None) a SubDeviceTraceController on every layer's MoE, so a ttnn
+        trace captured over forward() is split at the shared-expert/dispatch sub-device boundaries
+        (see utils/sub_device_trace.py). Pass None to restore plain eager load/clear."""
+        for layer in self.layers:
+            layer.set_trace_controller(controller)
+
+    def release_sub_device_managers(self):
+        """Remove every MoE-created overlap sub-device manager before closing the mesh device.
+        Ensures none is loaded first (clear is idempotent). Leaving managers registered at mesh close
+        has been observed to segfault the teardown. Safe/idempotent — call once at end of a run."""
+        self.mesh_device.clear_loaded_sub_device_manager()
+        for layer in self.layers:
+            layer.release_sub_device_managers()
 
     def _to_host(self, tt_tensor):
         """Bring SP+TP sharded tensor to host as [1, seq, emb] bfloat16."""
