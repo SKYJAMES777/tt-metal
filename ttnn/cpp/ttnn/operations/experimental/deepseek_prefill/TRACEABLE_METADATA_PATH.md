@@ -118,6 +118,20 @@ EXACT RESUME SPECIFICS for the kernel sync wiring (verified by inspection):
 - Test: rotation scenarios; metadata path passes kv_actual_isl=None (host can't compute q-mapping →
   kernels must → discriminating).
 
+**BLOCKER (current, task 4 active path):** the compute kernel reading the reader-produced CB fails to
+LINK on TRISC: `undefined reference to cb_interface` (from `CircularBuffer::get_read_ptr()` /
+`get_local_cb_interface`). It's gated by `if constexpr (kv_pad_from_metadata)`, so it's discarded on the
+scalar/indexed path (committed tests stay green) and only fails when the rotation metadata path is
+active (the uncommitted `test_ring_mla_metadata_matches_scalar_rotation`). `cb_interface` is
+`extern`/firmware-provided; the ring_joint compute kernel's `--just-symbols` weakened elf doesn't supply
+it (the matmul `bmm_..._gathered` compute kernel DOES use `get_local_cb_interface` successfully — diff
+its build/includes). CANDIDATE FIXES (pick one): (a) replicate whatever lets the matmul compute kernel
+link `cb_interface`; (b) AVOID cb_interface in compute — pass `cb_kv_pad_derived`'s L1 base address from
+the host (it knows CB addresses) as a compute compile/runtime arg, and read via a plain
+`volatile tt_l1_ptr uint32_t*` at that address (no cb_interface lookup); (c) read the scalars through the
+LLK tile path. Option (b) looks cleanest/most-portable. Reader producer + host gating + compute-consume
+scaffold are all COMMITTED and dormant (no regression); only the compute CB-read mechanism is unresolved.
+
 Plan: (1) new shared device header porting `compute_logical_nt` + `build_kv_pad_q_mapping_device` +
 `build_ring_work_masks_device` (the static derivation params — k_chunk_tile_count, kv_local_padded_Nt,
 num_local_k_chunks, q_chunk_group_tile_count, q_local_padded_Nt, num_joint_k_chunks, joint_seq_len,
