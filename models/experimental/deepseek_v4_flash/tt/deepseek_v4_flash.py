@@ -683,6 +683,10 @@ class DeepSeekV4HCACompressor:
         cached projection length (``n_win`` rows); the caller slices them.
         """
         kv, gate = self._project(hidden)
+        if len(kv.shape) == 4:
+            b, s, _, feat = kv.shape
+            kv = ttnn.reshape(kv, [b, s, feat])
+            gate = ttnn.reshape(gate, [b, s, feat])
         kv_all, gate_all = cache.append(kv, gate)
         return self._pool(kv_all, gate_all, cos_win, sin_win)
 
@@ -703,7 +707,7 @@ class DeepSeekV4HCACompressor:
         pooled from zero-filled (unwritten) projections and dropped by the caller's
         additive block-bias mask.
         """
-        kv, gate = self._project(hidden)  # [1, 1, Dh]
+        kv, gate = self._project(hidden)  # [1, 1, 1, Dh]
         kv = ttnn.reshape(kv, [1, 1, 1, self.head_dim])
         gate = ttnn.reshape(gate, [1, 1, 1, self.head_dim])
         _update_cache_at(kv_cache, kv, pos_tensor)
@@ -827,6 +831,10 @@ class DeepSeekV4CSACompressor:
         self, hidden: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor, cache: "_CompressorCache"
     ) -> ttnn.Tensor | None:
         kv, gate = self._project(hidden)
+        if len(kv.shape) == 4:
+            b, s, _, feat = kv.shape
+            kv = ttnn.reshape(kv, [b, s, feat])
+            gate = ttnn.reshape(gate, [b, s, feat])
         kv_all, gate_all = cache.append(kv, gate)
         return self._pool(kv_all, gate_all, cos_win, sin_win)
 
@@ -843,7 +851,7 @@ class DeepSeekV4CSACompressor:
         ``pos_tensor`` into the fixed ``[1, 1, cap, 2*Dh]`` caches, then pool the
         whole buffer (Ca/Cb overlap). See :meth:`DeepSeekV4HCACompressor.decode_static`."""
         feat = 2 * self.head_dim
-        kv, gate = self._project(hidden)  # [1, 1, 2*Dh]
+        kv, gate = self._project(hidden)  # [1, 1, 1, 2*Dh]
         kv = ttnn.reshape(kv, [1, 1, 1, feat])
         gate = ttnn.reshape(gate, [1, 1, 1, feat])
         _update_cache_at(kv_cache, kv, pos_tensor)
@@ -995,16 +1003,16 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         x = ttnn.permute(x, [1, 0, 2])  # [g, B*S, in_per_group]
         y = ttnn.matmul(x, self.o_a_weight, compute_kernel_config=_HIFI4)  # [g, B*S, o_lora_rank]
         y = ttnn.permute(y, [1, 0, 2])  # [B*S, g, o_lora_rank]
-        y = ttnn.reshape(y, [b, s, self.o_groups * self.o_lora_rank])
+        y = ttnn.reshape(y, [b, s, 1, self.o_groups * self.o_lora_rank])
         return self.o_b_proj(y)
 
     def _qkv(self, hidden: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Project + RoPE the query and (shared) K=V for ``hidden`` ``[B, S, D]``.
+        """Project + RoPE the query and (shared) K=V for ``hidden`` ``[B, S, 1, D]``.
 
         Returns ``q`` ``[B, H, S, Dh]`` and the rotated ``kv`` ``[B, 1, S, Dh]``
         (pre-compressor, pre-cache). Shared by the decode paths.
         """
-        b, s, _ = hidden.shape
+        b, s, _, _ = hidden.shape
         h, dh = self.num_heads, self.head_dim
         _profile(self.device)
 
@@ -1033,7 +1041,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
     ) -> ttnn.Tensor:
         """Single-token decode attention against the running ``kv_cache``.
 
-        ``hidden`` is ``[B, 1, D]`` (the new token); ``cos`` / ``sin`` / ``neg_sin``
+        ``hidden`` is ``[B, 1, 1, D]`` (the new token); ``cos`` / ``sin`` / ``neg_sin``
         are the single RoPE rows ``[1,1,1,Rd]`` at this token's absolute position;
         ``cos_win`` / ``sin_win`` cover every currently-emittable compressor window.
 
@@ -1043,7 +1051,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         sequence stays within ``index_topk * compress_rate``, matching the
         prefill port's degenerate-indexer assumption).
         """
-        b, s, _ = hidden.shape  # s == 1
+        b, s, _, _ = hidden.shape  # s == 1
 
         q, kv_new = self._qkv(hidden, cos, sin)  # q [B,H,1,Dh], kv_new [B,1,1,Dh]
         kv = kv_cache.sliding.append(kv_new)  # [B, 1, L_sld, Dh]
@@ -1581,9 +1589,9 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         self.shared_experts = DeepSeekV4MLP(weights, "shared_experts", device, cache=cache, weight_dtype=weight_dtype)
 
     def forward(self, hidden: ttnn.Tensor, input_ids: Optional[torch.Tensor] = None) -> ttnn.Tensor:
-        """``hidden`` ``[B, S, H]`` -> ``[B, S, H]``. ``input_ids`` is required
+        """``hidden`` ``[B, S, 1, H]`` -> ``[B, S, 1, H]``. ``input_ids`` is required
         only for hash-routed layers (frozen ``tid2eid`` selection)."""
-        b, s, h = hidden.shape
+        b, s, _, h = hidden.shape
         x_flat = ttnn.reshape(hidden, [1, 1, b * s, h])
         _profile(self.device)
 
@@ -1596,18 +1604,18 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
 
         with _region("MOE_EXPERTS"):
             routed = self.experts(x_flat, routing_weights)  # [1, 1, T, H]
-            routed = ttnn.reshape(routed, [b, s, h])
+            routed = ttnn.reshape(routed, [b, s, 1, h])
         _profile(self.device)
 
         with _region("MOE_SHARED"):
-            shared = self.shared_experts(hidden)  # [B, S, H]
+            shared = self.shared_experts(hidden)  # [B, S, 1, H]
 
         _profile(self.device)
 
         return ttnn.add(routed, shared)
 
     def decode_static(self, hidden: ttnn.Tensor, hash_token: ttnn.Tensor | None = None) -> ttnn.Tensor:
-        """Trace-safe single-token MoE. ``hidden`` ``[1, 1, H]`` -> ``[1, 1, H]``.
+        """Trace-safe single-token MoE. ``hidden`` ``[1, 1, 1, H]`` -> ``[1, 1, 1, H]``.
 
         Routing stays entirely on device: the learned top-k router is already
         host-sync-free, and hash layers gather their expert-selection mask on device
@@ -1622,7 +1630,7 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         else:
             routing_weights = self.gate.forward_static(x_flat)
         routed = self.experts.decode_static(x_flat, routing_weights)  # [1, 1, 1, H]
-        routed = ttnn.reshape(routed, [1, 1, h])
+        routed = ttnn.reshape(routed, [1, 1, 1, h])
         shared = self.shared_experts(hidden)
         return ttnn.add(routed, shared)
 
@@ -1634,9 +1642,9 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
     Given the residual stream stack ``hidden_streams [B, S, H, D]`` (``H`` =
     ``hc_mult`` parallel streams, ``D`` = ``hidden_size``) it returns the triple
     ``(post, comb, collapsed)``:
-      * ``collapsed [B, S, D]`` -- the ``pre``-weighted collapse of the streams
+      * ``collapsed [B, S, 1, D]`` -- the ``pre``-weighted collapse of the streams
         into a single sequence (the sublayer input),
-      * ``post [B, S, H]`` -- the sublayer-output placement weights
+      * ``post [B, S, H, 1]`` -- the sublayer-output placement weights
         (``2 * sigmoid(.)``),
       * ``comb [B, S, H, H]`` -- the stream-mixing matrix projected onto the
         doubly-stochastic manifold by ``hc_sinkhorn_iters`` Sinkhorn-Knopp steps.
@@ -1691,7 +1699,7 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
         self.pre_scale, self.post_scale, self.comb_scale = (float(scale[0]), float(scale[1]), float(scale[2]))
 
     def forward(self, hidden_streams: ttnn.Tensor):
-        """``hidden_streams`` ``[B, S, H, D]`` -> ``(post [B,S,H], comb [B,S,H,H], collapsed [B,S,D])``."""
+        """``hidden_streams`` ``[B, S, H, D]`` -> ``(post [B,S,H,1], comb [B,S,H,H], collapsed [B,S,1,D])``."""
         b, s, hc, d = hidden_streams.shape
         t = b * s
 
@@ -1723,9 +1731,9 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
         pre_col = ttnn.reshape(pre, [1, t, hc, 1])
         collapsed = ttnn.sum(ttnn.multiply(hs, pre_col), dim=-2, keepdim=True)  # [1,T,1,D]
 
-        post = ttnn.reshape(post, [b, s, hc])
+        post = ttnn.reshape(post, [b, s, hc, 1])
         comb = ttnn.reshape(comb, [b, s, hc, hc])
-        collapsed = ttnn.reshape(collapsed, [b, s, d])
+        collapsed = ttnn.reshape(collapsed, [b, s, 1, d])
         return post, comb, collapsed
 
 
@@ -1733,7 +1741,7 @@ class DeepSeekV4HyperHead(DeepSeekV4Module):
     """ttnn port of ``DeepseekV4HyperHead`` (final HC-stream collapse).
 
     Collapses the ``hc_mult`` residual streams ``[B, S, H, D]`` into a single
-    ``[B, S, D]`` sequence before the model's shared RMSNorm + ``lm_head``::
+    ``[B, S, 1, D]`` sequence before the model's shared RMSNorm + ``lm_head``::
 
         flat  = unweighted_rmsnorm(streams.flatten(2))
         pre   = sigmoid(hc_fn @ flat * hc_scale + hc_base) + eps
@@ -1768,7 +1776,7 @@ class DeepSeekV4HyperHead(DeepSeekV4Module):
         self.scale = float((scale_src() if callable(scale_src) else scale_src).flatten().tolist()[0])
 
     def forward(self, hidden_streams: ttnn.Tensor) -> ttnn.Tensor:
-        """``hidden_streams`` ``[B, S, H, D]`` -> ``[B, S, D]``."""
+        """``hidden_streams`` ``[B, S, H, D]`` -> ``[B, S, 1, D]``."""
         b, s, hc, d = hidden_streams.shape
         t = b * s
 
@@ -1781,7 +1789,7 @@ class DeepSeekV4HyperHead(DeepSeekV4Module):
         hs = ttnn.reshape(hidden_streams, [1, t, hc, d])
         pre_col = ttnn.reshape(pre, [1, t, hc, 1])
         out = ttnn.sum(ttnn.multiply(hs, pre_col), dim=-2, keepdim=True)  # [1,T,1,D]
-        return ttnn.reshape(out, [b, s, d])
+        return ttnn.reshape(out, [b, s, 1, d])
 
 
 def _strip_prefix(weights: dict, prefix: str) -> dict:
@@ -1803,7 +1811,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
 
         post, comb, collapsed = hc(streams)
         out = sublayer(norm(collapsed))
-        streams = post[..,None] * out[..,None,:] + (comb.T @ streams)
+        streams = post * out + (comb.T @ streams)
 
     ``comb`` is consumed *transposed* (mix over the first hc axis), matching the
     reference ``torch.matmul(comb.transpose(-1, -2), streams)``.
@@ -1868,7 +1876,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
     ) -> ttnn.Tensor:
         """``post[..,None] * out[..,None,:] + comb.T @ streams`` -> new streams.
 
-        ``post`` ``[B,S,H]``, ``comb`` ``[B,S,H,H]``, ``sublayer_out`` ``[B,S,D]``,
+        ``post`` ``[B,S,H,1]``, ``comb`` ``[B,S,H,H]``, ``sublayer_out`` ``[B,S,1,D]``,
         ``streams`` ``[B,S,H,D]``; returns ``[B,S,H,D]``.
         """
         b, s, hc, d = streams.shape
@@ -1937,6 +1945,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         """Trace-safe single-token decode (see :meth:`decode`). Uses the fixed-size
         in-place attention cache + the host-sync-free MoE so the whole block can be
         captured into a reusable ``ttnn`` trace."""
+        # return ttnn.assign(hidden_streams, memory_config=hidden_streams.memory_config())
         post, comb, collapsed = self.attn_hc(hidden_streams)
         attn_out = self.self_attn.decode_static(
             self.input_layernorm(collapsed),
@@ -2305,7 +2314,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
 
     def decode(self, token_id: int, pos: int, rope: dict) -> ttnn.Tensor:
         """Generate one step: feed ``token_id`` at absolute position ``pos`` against
-        the running KV cache; returns ``[B, 1, hidden]`` (apply ``lm_head`` for logits).
+        the running KV cache; returns ``[B, 1, 1, hidden]`` (apply ``lm_head`` for logits).
 
         ``rope`` is the *full* (max-length) host bundle; the needed rows are sliced
         per layer. The prompt is prefilled by calling this once per prompt token at
@@ -2739,7 +2748,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
         (device-to-device, no host hop and no per-step host op dispatch).
         Returns the last submesh's persistent output tensor — logits ``[1,1,vocab]``
         if an ``lm_head`` was passed to :meth:`prepare_static_decode`, else the
-        pre-head hidden ``[1,1,hidden]``.
+        pre-head hidden ``[1, 1, 1, hidden]``.
 
         The returned tensor is overwritten by the next call, so consume it (e.g.
         ``ttnn.to_torch``) before decoding the following token.
