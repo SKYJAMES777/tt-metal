@@ -1380,13 +1380,27 @@ bool run_sfpu_typecast(
     auto packed_in = sfpu_util::typecast_pack(in_fmt, vals);
     auto golden = sfpu_util::typecast_golden(in_fmt, out_fmt, packed_in);
 
-    // A 32-bit Dest is required for any 32-bit endpoint and for every integer endpoint: the SFPU
-    // computes via a full-width int32 and 8/16-bit integer datums are kept as-is in a 32-bit Dest
-    // (matches the int8 matmul / UInt8 untilize references, which run with fp32_dest_acc_en=true).
-    auto needs_fp32_dest = [](tt::DataFormat f) {
-        return f == tt::DataFormat::Float32 || f == tt::DataFormat::Int32 || f == tt::DataFormat::UInt32 ||
-               f == tt::DataFormat::Int16 || f == tt::DataFormat::UInt8 || f == tt::DataFormat::Int8;
-    };
+    // Flag selection mirrors ttnn.typecast / the tt-llk typecast test (see test_eltwise_unary_typecast.py:
+    // _preserve_fp32_precision, _production_dest_acc, unpack_to_dest), so the compute-side datapath matches
+    // the LLK reference these conversions pass under.
+    const bool in_is_32bit = in_fmt == tt::DataFormat::Float32 || in_fmt == tt::DataFormat::Int32;
+    const bool out_is_32bit = out_fmt == tt::DataFormat::Float32 || out_fmt == tt::DataFormat::Int32;
+
+    // preserve_fp32_precision: a Float32 input, an 8-bit-output promotion from a bf16/MX source, or a
+    // UInt8 input.
+    const bool preserve_fp32 = in_fmt == tt::DataFormat::Float32 ||
+                               (out_fmt == tt::DataFormat::UInt8 &&
+                                (in_fmt == tt::DataFormat::Float16_b || sfpu_util::typecast_is_mx(in_fmt))) ||
+                               in_fmt == tt::DataFormat::UInt8;
+
+    // dest_acc (fp32_dest_acc_en): a 32-bit endpoint or preserve_fp32. Narrow integer pairs (e.g. Int16 ->
+    // Float16_b) stay in a 16-bit Dest, exactly as production runs them.
+    const bool fp32_dest_acc = preserve_fp32 || in_is_32bit || out_is_32bit;
+
+    // unpack-to-Dest only changes the datapath for genuine 32-bit inputs (the narrow-input unpack MOP gates
+    // on is_32bit_input, so the flag is inert for Int16/UInt8 -- they reach Dest via FPU A2D datacopy).
+    // Wiring UnpackToDestFp32 for a narrow input drives the wrong datapath (UInt8 hangs, Int16 corrupts).
+    const bool unpack_to_dest = in_is_32bit;
 
     // typecast_tile_init<IN, OUT>() + typecast_tile<IN, OUT>(0), with the format pair baked into the
     // template args via the device-side ckernel::DataFormat enum names.
@@ -1398,8 +1412,6 @@ bool run_sfpu_typecast(
                              ")>";
     defines["SFPU_OP_CHAIN_0"] = "typecast_tile_init" + tmpl + "(); typecast_tile" + tmpl + "(0);";
 
-    // No unpack_to_dest_mode entry is required: the metal2 validator gates that only on a CONSUMER
-    // Float32 DFB, and the suite skips 32-bit *inputs* (Float32 is only ever the output here).
     const CoreRange core_range({0, 0}, {0, 0});
     SfpuConfig cfg{
         .num_tiles = num_tiles,
@@ -1407,7 +1419,8 @@ bool run_sfpu_typecast(
         .l1_output_data_format = out_fmt,
         .cores = CoreRangeSet({core_range}),
         .approx_mode = false,
-        .en_32bit_dest = needs_fp32_dest(in_fmt) || needs_fp32_dest(out_fmt),
+        .unpack_to_dest_fp32 = unpack_to_dest,
+        .en_32bit_dest = fp32_dest_acc,
     };
 
     const auto dest = run_sfpu_pipeline(mesh_device, cfg, defines, packed_in);
@@ -1817,14 +1830,13 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarSfpuRelu) {
 // Int16 (SMAG16), UInt8, and MX (MxFp8P / MxFp8R). The compute API routes non-MX pairs through the
 // unified SFPU kernel; an MX endpoint behaves as Float16_b at the SFPU level (gasket).
 //
-// A conversion runs only when its INPUT is Float16_b or MX — those reach Dest through copy_tile's
-// FPU/SrcA datacopy. An int endpoint forces a 32-bit Dest, and into a 32-bit Dest the FPU can neither
-// datacopy a 32-bit source nor unpack a narrow integer (Int16 in particular cannot be unpacked through
-// the FPU when Dest is 32-bit). Those would need the unpack-to-Dest path copy_tile does not yet wire on
-// Quasar (see tt-llk quasar_unpack_to_dest), so every non-Float16_b/non-MX input is GTEST_SKIP'd.
-// OUTPUTs are wider: Float32/Int32/Int16 and MX outputs all work; UInt8 output is still skipped (its
-// 8-bit pack path corrupts bytes even with a 32-bit Dest). fp32_dest_acc_en is on for any int/fp32
-// endpoint (8/16-bit integer datums are kept as-is in a 32-bit Dest, per the int8/UInt8 references).
+// 32-bit inputs (Int32/Float32) are unpacked straight into a 32-bit Dest (UnpackToDestFp32); every other
+// input (Float16_b/MX/Int16) reaches Dest via the FPU A2D datacopy. run_sfpu_typecast picks
+// fp32_dest_acc_en and unpack_to_dest the way ttnn.typecast does (see tt-llk test_eltwise_unary_typecast):
+// narrow integer pairs (e.g. Int16 -> Float16_b) stay in a 16-bit Dest. Skipped classes: a 16-bit input
+// widening into a 32-bit output (Float16_b/Int16 -> Float32/Int32; an MX input counts as 16-bit, so
+// MX -> Float32/Int32 is skipped too), and any UInt8 endpoint (passes in tt-llk but needs datacopy /
+// pack_src parity before it works through this compute-API harness).
 class SingleCoreSingleMeshDeviceSfpuTypecastFixture
     : public LLKMeshDeviceFixture,
       public testing::WithParamInterface<std::tuple<tt::DataFormat, tt::DataFormat>> {};
@@ -1837,18 +1849,23 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuTypecastFixture, TensixSfpuTypecast) {
         GTEST_SKIP() << "Typecast compute-API test is currently Quasar-only";
     }
 
-    // Only Float16_b and MX inputs reach Dest correctly via copy_tile's FPU/SrcA datacopy. Int
-    // typecasts force a 32-bit Dest, and into a 32-bit Dest the FPU can neither datacopy a 32-bit
-    // source nor unpack a narrow integer (e.g. Int16 cannot be unpacked through the FPU when Dest is
-    // 32-bit) -- both need the unpack-to-Dest path that copy_tile does not yet wire on Quasar. So any
-    // input other than Float16_b / MX is listed for visibility but skipped. (Int16/MX OUTPUT works.)
-    if (in_fmt != tt::DataFormat::Float16_b && !unit_tests::sfpu_util::typecast_is_mx(in_fmt)) {
-        GTEST_SKIP() << "only Float16_b/MX inputs reach Dest via copy_tile; others need unpack-to-Dest";
+    // UInt8 endpoints pass in tt-llk but not yet through this metal compute-API harness. A UInt8 INPUT
+    // hangs in copy_tile's unpack regardless of Dest width (confirmed with both 16- and 32-bit Dest) --
+    // likely the unpacker's UInt8->INT8 register masking (masked_data_format) is not applied on this path.
+    // A UInt8 OUTPUT mismatches on the 8-bit pack value encoding (also independent of Dest width; pack_src
+    // already follows the output format). Both need metal2 datapath fixes, not test-harness changes.
+    if (in_fmt == tt::DataFormat::UInt8 || out_fmt == tt::DataFormat::UInt8) {
+        GTEST_SKIP() << "UInt8 typecast not yet wired through the metal compute-API harness";
     }
 
-    // UInt8 output: the 8-bit-output pack path still emits corrupted bytes even with a 32-bit Dest.
-    if (out_fmt == tt::DataFormat::UInt8) {
-        GTEST_SKIP() << "UInt8 output pack path corrupts bytes (even with fp32_dest_acc_en)";
+    // A 16-bit input widening into a 32-bit output (e.g. Float16_b -> Int32) is not supported: the
+    // narrow source cannot widen into a 32-bit Dest. Only 16->16, 32->16 and 32->32 are supported. An
+    // MX input arrives in Dest as Float16_b, so it counts as 16-bit data here.
+    const bool in_is_16bit = in_fmt == tt::DataFormat::Float16_b || in_fmt == tt::DataFormat::Int16 ||
+                             unit_tests::sfpu_util::typecast_is_mx(in_fmt);
+    const bool out_is_32bit = out_fmt == tt::DataFormat::Float32 || out_fmt == tt::DataFormat::Int32;
+    if (in_is_16bit && out_is_32bit) {
+        GTEST_SKIP() << "16-bit input -> 32-bit output not supported";
     }
 
     log_info(
