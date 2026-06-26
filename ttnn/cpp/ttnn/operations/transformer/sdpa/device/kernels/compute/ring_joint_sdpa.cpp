@@ -9,6 +9,7 @@
 
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/cb_api.h"  // ckernel::read_tile_value (UNPACK-mailbox CB scalar read; no cb_interface)
 #include <tt-metalium/constants.hpp>
 #include "compute_common.hpp"
 #include "compute_streaming.hpp"
@@ -166,15 +167,18 @@ void kernel_main() {
     // from metadata[1] and handed them over via cb_kv_pad_derived (compute can't NoC-read DRAM). Override
     // the (trace-frozen) runtime args with the reader's values before the ring loop uses them.
     if constexpr (kv_pad_from_metadata) {
+        // Read the reader-produced scalars via ckernel::read_tile_value (UNPACK-mailbox CB read) -- the
+        // TRISC-safe way to pull a scalar out of a CB, mirroring sparse_sdpa_compute's cb_ctrl. The
+        // CircularBuffer::get_read_ptr() path references the cb_interface global which does not link on
+        // this compute kernel. wait_front/pop_front are LLK intrinsics and link fine.
         CircularBuffer cb_derived(cb_kv_pad_derived);
         cb_derived.wait_front(1);
-        volatile tt_l1_ptr uint32_t* d = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cb_derived.get_read_ptr());
-        logical_nt = d[0];
-        kv_pad_q_pre_wrap_start_tile = d[1];
-        kv_pad_q_pre_wrap_tile_count = d[2];
-        kv_pad_q_post_wrap_start_tile = d[3];
-        kv_pad_q_valid_tile_count = d[4];
-        active_ring_iter_mask = d[5];
+        logical_nt = ckernel::read_tile_value(cb_kv_pad_derived, /*tile=*/0, /*element_offset=*/0);
+        kv_pad_q_pre_wrap_start_tile = ckernel::read_tile_value(cb_kv_pad_derived, 0, 1);
+        kv_pad_q_pre_wrap_tile_count = ckernel::read_tile_value(cb_kv_pad_derived, 0, 2);
+        kv_pad_q_post_wrap_start_tile = ckernel::read_tile_value(cb_kv_pad_derived, 0, 3);
+        kv_pad_q_valid_tile_count = ckernel::read_tile_value(cb_kv_pad_derived, 0, 4);
+        active_ring_iter_mask = ckernel::read_tile_value(cb_kv_pad_derived, 0, 5);
         cb_derived.pop_front(1);
     }
 

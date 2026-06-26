@@ -3133,6 +3133,126 @@ def test_ring_mla_metadata_matches_scalar_indexed(kv_cache_batch_idx):
         close_ring_joint_sdpa_runtime(runtime)
 
 
+@pytest.mark.parametrize("kv_actual_isl", [64, 256, 320], ids=["kv64", "kv256", "kv320"])
+def test_ring_mla_metadata_matches_scalar_rotation(kv_actual_isl):
+    """KV-pad rotation: the metadata path (kv_actual_isl read on-device from metadata[1], with logical_nt
+    / q-mapping / ring masks derived in the reader and handed to compute via cb_kv_pad_derived) must be
+    bit-identical to the scalar path (host kv_actual_isl). This is the discriminating test for the task-4
+    on-device derivation: on the metadata path kv_actual_isl is dropped, so the host CANNOT compute the
+    q-mapping -- it comes solely from the reader's metadata-driven derivation. Both paths run indexed
+    (single-slot) mode at slot 0 so the only difference under test is where kv_actual_isl comes from."""
+    mesh_config = MESH_CONFIG
+    if mesh_config.sp_size < 2:
+        pytest.skip(f"ring_mla requires at least 2 devices in ring, got SP={mesh_config.sp_size}")
+    sp_size = mesh_config.sp_size
+    tile = 32
+    chunk_size_local = 64
+    chunk_size_global = chunk_size_local * sp_size
+    new_actual_isl = chunk_size_global  # one full new chunk
+    assert kv_actual_isl % tile == 0
+
+    b, local_heads = 1, 4
+    nhq = local_heads * mesh_config.tp_size
+    nhk = 1
+    d_q, d_k, d_v = 64, 64, 32
+    logical_n = kv_actual_isl + new_actual_isl
+
+    torch.manual_seed(1234)
+    old_cache_kv = fa_rand(b, nhk, kv_actual_isl, d_k)
+    new_tokens_q = fa_rand(b, nhq, new_actual_isl, d_q)
+    new_tokens_kv = fa_rand(b, nhk, new_actual_isl, d_k)
+    q_host, kv_host, valid_rows, _, num_cache_slabs = build_kv_pad_rotation_mla_inputs(
+        old_cache_kv, new_tokens_q, new_tokens_kv, kv_actual_isl, sp_size, chunk_size_local
+    )
+    cache_seq_per_dev = num_cache_slabs * chunk_size_local
+
+    runtime = open_ring_joint_sdpa_runtime(mesh_config)
+    mesh_device = runtime.mesh_device
+    sp_axis, tp_axis = runtime.sp_axis, runtime.tp_axis
+    try:
+        q_shard_dims = [None, None]
+        q_shard_dims[sp_axis] = 2
+        if mesh_config.tp_size > 1:
+            q_shard_dims[tp_axis] = 1
+        kv_shard_dims = [None, None]
+        kv_shard_dims[sp_axis] = 2  # latent K/V sharded along seq across the ring
+        persistent_shard_dims = [None, None]  # gathered KV replicated
+
+        tt_q = ttnn.from_torch(
+            q_host,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh_device,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=q_shard_dims),
+        )
+        tt_kv = ttnn.from_torch(
+            kv_host,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh_device,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=kv_shard_dims),
+        )
+        persistent_output_buffer_kv = ttnn.from_torch(
+            torch.zeros(b, nhk, sp_size * cache_seq_per_dev, d_k),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh_device,
+            mesh_mapper=ttnn.ShardTensor2dMesh(
+                mesh_device, mesh_shape=tuple(mesh_device.shape), dims=persistent_shard_dims
+            ),
+        )
+
+        program_config = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=runtime.sdpa_compute_grid,
+            q_chunk_size=32,
+            k_chunk_size=32,
+            exp_approx_mode=False,
+        )
+        # metadata = [slot_id=0, actual_start=kv_actual_isl, actual_end=logical_n]
+        tt_meta = _make_ring_mla_metadata(mesh_device, slot_id=0, actual_start=kv_actual_isl, actual_end=logical_n)
+
+        main_row_dim = q_shard_dims[0] if q_shard_dims[0] is not None else -1
+        main_col_dim = q_shard_dims[1] if q_shard_dims[1] is not None else -1
+        composer = ttnn.create_mesh_composer(mesh_device, ttnn.MeshComposerConfig(main_row_dim, main_col_dim))
+
+        def run(use_metadata):
+            tt_out, _ = ttnn.transformer.ring_mla(
+                tt_q,
+                tt_kv,
+                persistent_output_buffer_kv=persistent_output_buffer_kv,
+                head_dim_v=d_v,
+                logical_n=logical_n,
+                is_balanced=False,
+                program_config=program_config,
+                compute_kernel_config=runtime.compute_kernel_config,
+                dim=2,
+                multi_device_global_semaphore=runtime.ccl_semaphore_handles,
+                num_links=runtime.num_links,
+                cluster_axis=sp_axis,
+                mesh_device=mesh_device,
+                topology=runtime.topology,
+                subdevice_id=runtime.worker_sub_device_id,
+                ccl_core_grid_offset=(runtime.ccl_column, 0),
+                use_column_major_ccl=True,
+                # Both paths run indexed at slot 0; the metadata path additionally drops kv_actual_isl so
+                # the q-mapping must be derived on-device from metadata[1].
+                kv_cache_batch_idx=None if use_metadata else 0,
+                kv_actual_isl=None if use_metadata else kv_actual_isl,
+                metadata=tt_meta if use_metadata else None,
+            )
+            return ttnn.to_torch(tt_out, mesh_composer=composer)[:, :, valid_rows, :d_v]
+
+        out_scalar = run(use_metadata=False)
+        out_meta = run(use_metadata=True)
+        assert torch.equal(out_scalar, out_meta), (
+            f"kv_actual_isl={kv_actual_isl}: metadata-path ring_mla output differs from scalar-path "
+            f"(max abs diff {(out_scalar - out_meta).abs().max().item()})"
+        )
+        logger.success(f"ring_mla rotation kv_actual_isl={kv_actual_isl}: metadata path == scalar path (bit-exact)")
+    finally:
+        close_ring_joint_sdpa_runtime(runtime)
+
+
 # Generate perf test parameters dynamically based on detected hardware for different models (WAN, MLA, VideGen...)
 TEST_CONFIGS, TEST_CONFIG_IDS = generate_test_configs(MESH_CONFIG, RING_JOINT_PERF_MODEL_CONFIGS)
 TEST_CONFIG_MODELS = list(MODEL_CONFIGS.keys())
