@@ -116,6 +116,16 @@ struct RingJointSDPAInputs {
     Tensor gathered_k;
     std::optional<Tensor> gathered_v;
 
+    // Trace-safe metadata path (opt-in): a small uint32 DRAM tensor holding the runner's
+    // h2d_socket_sync payload in canonical layout [slot_id, actual_start, actual_end]. When present,
+    // the per-chunk scalars that would otherwise be host-computed and frozen by a ttnn trace
+    // (kv_cache_batch_idx = slot_id; kv_actual_isl = actual_start; logical_n = actual_start +
+    // chunk_size_global) are read on-device from this tensor and recomputed in the kernels, so one
+    // captured program replays across chunks. std::nullopt => classic host-scalar path (unchanged).
+    std::optional<Tensor> metadata;
+
+    bool has_metadata() const { return metadata.has_value(); }
+
     // Chunked-prefill is signalled implicitly by Q being shorter than the per-device K shard:
     // Q is the latest slab, K is the populated prefix from chunk 0 through the current chunk.
     uint32_t local_kv_seq_len() const { return static_cast<uint32_t>(input_k.logical_shape()[2]); }

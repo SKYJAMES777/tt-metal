@@ -88,6 +88,11 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     // only the valid (e.g. logical_n-sized) prefix. Capped to the input height per gathered tensor.
     // std::nullopt => gather the full input (default). The fused ring_joint_sdpa path also re-patches
     // this per dispatch on cache hits (see apply_ring_joint_scalar_runtime_args).
-    std::optional<uint32_t> gather_valid_Ht = std::nullopt);
+    std::optional<uint32_t> gather_valid_Ht = std::nullopt,
+    // Trace-safe slot select: when set (with input_batch_slice_idx engaged), the readers recompute the
+    // single-slot gather offset from slot_id = metadata[0] on-device, so a captured trace replays across
+    // cache slots. metadata is the runner's [slot_id, actual_start, actual_end] uint32 DRAM tensor.
+    // std::nullopt => take the host input_batch_base (default; existing callers unaffected).
+    std::optional<Tensor> metadata = std::nullopt);
 
 }  // namespace ttnn

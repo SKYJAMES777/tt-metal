@@ -106,7 +106,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_mla_wrapper(
     bool use_column_major_ccl,
     bool is_balanced,
     std::optional<uint32_t> kv_cache_batch_idx,
-    std::optional<uint32_t> kv_actual_isl) {
+    std::optional<uint32_t> kv_actual_isl,
+    const std::optional<ttnn::Tensor>& metadata) {
     auto strategy = use_column_major_ccl ? ttnn::ccl::CoreAllocationStrategy::COL_MAJOR
                                          : ttnn::ccl::CoreAllocationStrategy::ROW_MAJOR;
     return ttnn::transformer::ring_mla(
@@ -129,7 +130,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_mla_wrapper(
         compute_kernel_config,
         strategy,
         kv_cache_batch_idx,
-        kv_actual_isl);
+        kv_actual_isl,
+        metadata);
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> exp_ring_joint_scaled_dot_product_attention_wrapper(
@@ -632,7 +634,8 @@ void bind_sdpa(nb::module_& mod) {
         nb::arg("use_column_major_ccl") = false,
         nb::arg("is_balanced").noconvert() = false,
         nb::arg("kv_cache_batch_idx").noconvert() = nb::none(),
-        nb::arg("kv_actual_isl").noconvert() = nb::none());
+        nb::arg("kv_actual_isl").noconvert() = nb::none(),
+        nb::arg("metadata").noconvert() = nb::none());
 
     const auto* exp_ring_joint_doc = R"doc(
         ExpRingJointAttention operation that efficiently performs non-causal attention over two

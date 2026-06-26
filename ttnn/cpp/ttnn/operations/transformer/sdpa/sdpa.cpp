@@ -275,7 +275,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_mla(
     std::optional<DeviceComputeKernelConfig> compute_kernel_config,
     ttnn::ccl::CoreAllocationStrategy core_allocation_strategy,
     std::optional<uint32_t> kv_cache_batch_idx,
-    std::optional<uint32_t> kv_actual_isl) {
+    std::optional<uint32_t> kv_actual_isl,
+    const std::optional<ttnn::Tensor>& metadata) {
     auto output_tensors = ttnn::prim::ring_joint_scaled_dot_product_attention(
         input_tensor_q,
         input_tensor_kv,
@@ -304,7 +305,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_mla(
         core_allocation_strategy,
         kv_cache_batch_idx,
         kv_actual_isl,
-        head_dim_v);
+        head_dim_v,
+        metadata);
     return {output_tensors[prim::RING_JOINT_SDPA_OUTPUT_IDX], output_tensors[prim::RING_JOINT_SDPA_STATS_OUTPUT_IDX]};
 }
 

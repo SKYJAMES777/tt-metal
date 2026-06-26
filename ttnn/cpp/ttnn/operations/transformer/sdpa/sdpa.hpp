@@ -114,7 +114,11 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ring_mla(
     std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
     ttnn::ccl::CoreAllocationStrategy core_allocation_strategy = ttnn::ccl::CoreAllocationStrategy::ROW_MAJOR,
     std::optional<uint32_t> kv_cache_batch_idx = std::nullopt,
-    std::optional<uint32_t> kv_actual_isl = std::nullopt);
+    std::optional<uint32_t> kv_actual_isl = std::nullopt,
+    // Trace-safe metadata path: when set, the per-chunk scalars (kv_cache_batch_idx / kv_actual_isl /
+    // logical_n) are read on-device from this uint32 DRAM tensor ([slot_id, actual_start, actual_end])
+    // instead of being baked into the program, so one captured ttnn trace replays across chunks.
+    const std::optional<ttnn::Tensor>& metadata = std::nullopt);
 
 struct ExecuteExpRingJointAttention {
     static std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> invoke(

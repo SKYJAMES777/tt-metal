@@ -776,7 +776,10 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     }
 
     // q_local_padded_N (Q rows per device) can be shorter than kv_local_padded_N for chunked prefill.
-    const bool indexed_kv_cache = args.has_indexed_kv_cache();
+    // Indexed (single-slot) mode is also engaged on the trace-safe metadata path, where the slot is read
+    // on-device from metadata[0] instead of the host kv_cache_batch_idx scalar.
+    const bool slot_from_metadata = tensor_args.has_metadata();
+    const bool indexed_kv_cache = args.has_indexed_kv_cache() || slot_from_metadata;
     // Latent-V mode: V tensors are omitted; the reader reuses K's buffer and
     // reads only the first vDHt head-dim tiles.
     const uint32_t B = q_shape[0];
@@ -1175,6 +1178,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         compile_time_active_ring_iter_mask,
         NHV,
         static_cast<uint32_t>(v_shares_k_buffer),
+        // Slot 32: trace-safe slot select. When set, the reader reads kv_cache_batch_idx from
+        // metadata[0] on-device (common runtime arg 0) instead of the per-core kv_cache_batch_idx arg.
+        static_cast<uint32_t>(slot_from_metadata),
     };
 
     TensorAccessorArgs(input_tensor_q.buffer()).append_to(reader_compile_time_args);
@@ -1186,6 +1192,12 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         TensorAccessorArgs(joint_tensor_q->buffer()).append_to(reader_compile_time_args);
         TensorAccessorArgs(joint_tensor_k->buffer()).append_to(reader_compile_time_args);
         TensorAccessorArgs(joint_tensor_v->buffer()).append_to(reader_compile_time_args);
+    }
+    // Metadata accessor follows the tensor accessors (metadata path only) and precedes the chain
+    // semaphore compile args; the reader kernel gates its offset on slot_from_metadata. sem_args_offset
+    // below is computed after this append, so the chain/CB compile-arg indices stay correct.
+    if (slot_from_metadata) {
+        TensorAccessorArgs(tensor_args.metadata->buffer()).append_to(reader_compile_time_args);
     }
 
     /**
@@ -2219,6 +2231,13 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     reader_kernel.compile_time_args = reader_compile_time_args;
     reader_kernel.defines = kernel_defines;
     reader_kernel.config = ReaderConfigDescriptor{};
+    // Trace-safe slot select: the metadata tensor's raw DRAM address is common runtime arg 0; the reader
+    // reads slot_id = metadata[0] from it on-device. Raw address (not a Buffer* binding) mirrors the
+    // proven update_padded_kv_cache pattern. The address is constant across chunks (persistent tensor),
+    // so a captured trace replays correctly without re-patching.
+    if (slot_from_metadata) {
+        reader_kernel.emplace_common_runtime_args({tensor_args.metadata->buffer()->address()});
+    }
 
     KernelDescriptor writer_kernel{};
     writer_kernel.kernel_source =
@@ -2402,8 +2421,15 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     }
     // Append the all-gather portion to `desc`. Buffer addresses are auto-patched on cache hits; the
     // indexed-mode input_batch_base scalar is re-patched in apply_ring_joint_scalar_runtime_args.
+    // Single-slot gather is engaged whenever the op is in indexed mode -- either a host kv_cache_batch_idx
+    // (scalar path) or a metadata tensor (trace-safe path, where the slot is read on-device from
+    // metadata[0]). On the metadata path the host slot is absent, so pass a valid placeholder (0) to turn
+    // on single-slot structure; the all-gather reader recomputes the real offset from metadata.
+    const bool ag_indexed = args.has_indexed_kv_cache() || tensor_args.has_metadata();
+    const std::optional<uint32_t> gather_slice_idx =
+        ag_indexed ? std::optional<uint32_t>(args.kv_cache_batch_idx.value_or(0)) : std::nullopt;
     // The trailing kv_cache_batch_idx makes the gather collect only that cache slot (std::nullopt =>
-    // full batch).
+    // full batch). When metadata is supplied the readers read slot_id from metadata[0] on-device.
     ring_attention_all_gather_async_multi_core_with_workers_helper(
         desc,
         all_gather_input_tensors,
@@ -2421,11 +2447,12 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         all_gather_fused_op_signaler,
         args.ccl_core_grid_offset,
         args.all_gather_operation_attributes.core_allocation_strategy,
-        args.kv_cache_batch_idx,
+        gather_slice_idx,
         // Bound the gather to the logical_n-valid prefix at create time so the first (cache-miss)
         // dispatch moves only kv_actual-sized data, not the whole oversized cache. Re-patched per
         // dispatch on cache hits in apply_ring_joint_scalar_runtime_args.
-        compute_gather_valid_Ht(args, tensor_args));
+        compute_gather_valid_Ht(args, tensor_args),
+        tensor_args.metadata);
 
     return desc;
 }

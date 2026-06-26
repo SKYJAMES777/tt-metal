@@ -30,6 +30,12 @@ constexpr uint32_t contig_pages_advanced = get_compile_time_arg_val(7);  // 2
 constexpr uint32_t num_inputs = get_compile_time_arg_val(8);
 constexpr bool direction = get_compile_time_arg_val(9);  // 1 is forward, 0 is backward
 constexpr bool fuse_op = get_compile_time_arg_val(10);
+// Trace-safe metadata path: when set, the single-slot gather offset (input_batch_base) is recomputed
+// on-device from slot_id = metadata[0] instead of taken from the (trace-frozen) runtime arg. cb_meta_id
+// is a tiny L1 CB for the metadata page; the metadata accessor's compile args follow the output
+// accessors. When has_metadata is false neither is emitted and this kernel is bit-identical.
+constexpr bool has_metadata = get_compile_time_arg_val(11);
+constexpr uint32_t cb_meta_id = get_compile_time_arg_val(12);
 
 // Prefetch: batch multiple packets of DRAM reads before a single barrier.
 // This keeps more reads in flight across interleaved DRAM banks, hiding latency.
@@ -89,11 +95,20 @@ FORCE_INLINE void prefetch_batch_read_tiles(
 }
 
 void kernel_main() {
-    constexpr uint32_t page_size_base_idx = 11;
+    constexpr uint32_t page_size_base_idx = 13;
     constexpr auto inputs_args = make_tensor_accessor_args_tuple<num_inputs, page_size_base_idx + num_inputs>();
     constexpr auto outputs_args = make_tensor_accessor_args_tuple<
         num_inputs,
         std::get<num_inputs - 1>(inputs_args).next_compile_time_args_offset()>();
+    // The metadata accessor's compile args follow the output accessors (metadata path only). When
+    // has_metadata is false the metadata accessor is NOT emitted, so fall back to a VALID (but unused)
+    // accessor offset -- the inputs-accessor start -- rather than 0: TensorAccessorArgs<> is instantiated
+    // here unconditionally (it is not a dependent template), and offset 0 names my_chip_id, which fails
+    // the accessor's internal static_assert. meta_args is only *used* inside `if constexpr(has_metadata)`.
+    constexpr uint32_t kMetaArgsOffset = has_metadata
+                                             ? std::get<num_inputs - 1>(outputs_args).next_compile_time_args_offset()
+                                             : (page_size_base_idx + num_inputs);
+    constexpr auto meta_args = TensorAccessorArgs<kMetaArgsOffset>();
 
     ///////////////////////////////////////////////////
     // ARGS
@@ -139,6 +154,28 @@ void kernel_main() {
     auto outputs_tuple = make_tensor_accessor_tuple(outputs_args, arg_idx);
     arg_idx += num_inputs;
     auto output_tensor_addrgens = make_abstract_tensor_accessor_wrappers(outputs_tuple);
+
+    // Trace-safe single-slot gather: recompute input_batch_base from slot_id = metadata[0] on-device,
+    // so a captured trace replays across cache slots (the host runtime-arg input_batch_base, set for the
+    // capture-time slot, would otherwise be frozen). input_batch_base = slot * num_heads * Ht * Wt,
+    // matching ring_attention_all_gather_async_detail::input_batch_base_pages. The metadata DRAM address
+    // is the next runtime arg (emitted before the optional signaler args).
+    if constexpr (has_metadata) {
+        constexpr uint32_t kMetadataReadBytes = 16;  // [slot_id, actual_start, actual_end, pad] uint32
+        const uint32_t metadata_addr = get_arg_val<uint32_t>(arg_idx++);
+        Noc meta_noc;
+        CircularBuffer cb_meta(cb_meta_id);
+        const auto s_meta = TensorAccessor(meta_args, metadata_addr);
+        meta_noc.async_read(
+            s_meta, CoreLocalMem<uint8_t>(cb_meta.get_write_ptr()), kMetadataReadBytes, {.page_id = 0}, {});
+        meta_noc.async_read_barrier();
+        CoreLocalMem<volatile uint32_t> meta(cb_meta.get_write_ptr());
+        const uint32_t slot_id = meta[0];
+        for (uint32_t input_idx = 0; input_idx < num_inputs; input_idx++) {
+            input_batch_base[input_idx] =
+                slot_id * input_batch_head_count[input_idx] * input_tensor_Ht[input_idx] * input_tensor_Wt[input_idx];
+        }
+    }
 
     OpSignaler op_signaler;
     if constexpr (fuse_op) {

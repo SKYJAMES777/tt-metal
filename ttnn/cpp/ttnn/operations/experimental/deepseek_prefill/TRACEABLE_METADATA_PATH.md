@@ -38,10 +38,70 @@ the trace-safe one.
 | `update_padded_kv_cache` | `slot_idx`→0, `kv_actual_global`→1 | writer (dataflow) | **done** |
 | `rotary_embedding_indexed` (Q + KV rope) | `kv_actual_global`→1 | reader (dataflow) | **done** |
 | `zero_padded_kv_cache` | `slot_idx`→0, `valid_global`(=actual_end)→2 | reader + writer (dataflow) | **done** |
-| `ring_mla` | `kv_actual_isl`, `logical_n`, `kv_cache_batch_idx` | reader + **compute** | **TODO** (separate plan) |
+| `ring_mla` | `kv_cache_batch_idx`→0, `kv_actual_isl`→1, `logical_n`=`actual_start`+chunk | SDPA reader + all-gather reader (+ compute, task 4) | **in progress** |
 
 `ring_mla` is harder: `kv_actual_isl` drives host-side ring-iteration masks / Q-mapping / valid-page
 counts baked into runtime args, and its **compute** kernel needs derived values — needs its own design.
+
+### ring_mla migration plan (incremental)
+
+`ring_mla` is `ttnn.transformer.ring_mla` → the `ring_joint_sdpa` device op, with a fused
+`ring_attention_all_gather_async` sub-program. A single optional `metadata` tensor is threaded through
+(`tensor_args.metadata`, in the program hash via `has_metadata()`); the public API gains a `metadata=`
+kwarg (single optional, not a C++ overload — the signature is too large). Each per-chunk scalar is
+migrated on-device one at a time; a bit-exact `metadata == scalar` test
+(`test_ring_mla_metadata_matches_scalar_*` in `tests/nightly/blackhole/sdpa/test_ring_joint_sdpa.py`)
+gates each step, with `META_PATH_HOST_SCALARS` tracking which scalars are not yet on-device.
+
+**Step 1 — `kv_cache_batch_idx` → `metadata[0]` (slot_id). DONE + verified bit-exact (slot 0/1) on 8×4.**
+It is consumed in TWO kernels: the fused **all-gather reader** (gather offset
+`input_batch_base = slot * num_heads * Ht * Wt`) and the **SDPA reader** (`ring_joint_reader.cpp`
+local-KV slot, `kv_batch`). "Indexed mode" turns on when `kv_cache_batch_idx.has_value() || has_metadata()`
+(host op + validation + all-gather validate). On the metadata path the host passes no slot scalar; each
+reader reads `slot_id` from `metadata[0]` on-device.
+- All-gather reader: `has_metadata` compile flag + dedicated meta CB (`c_in3`) + `HasMeta`-dependent
+  `TensorAccessorArgs` offset (fallback to a VALID unused accessor offset, NOT 0 — offset 0 fails the
+  accessor's internal `static_assert` at JIT time) + metadata DRAM address as a per-core runtime arg.
+- SDPA reader: `slot_from_metadata` compile flag (slot 32, accessors shift to 33) + metadata accessor
+  inserted between the tensor accessors and the chain-semaphore compile args (chain base offset shifted,
+  flag-dependent) + metadata DRAM address as **common runtime arg 0** (raw address, mirrors update_cache).
+- **Gotchas hit + fixed (both cost a device hang / JIT abort):** (1) the `TensorAccessorArgs<0>` fallback
+  static_assert above; (2) a NoC read into a kernel **stack buffer hangs** — the destination must be a
+  real L1 CB address. The SDPA reader reads into `cb_q_in`'s L1 scratch (free before the main loop fills
+  it). Localized with `DPRINT` + `TT_METAL_DPRINT_CORES=all` (AG post-read fired, SDPA post-read didn't).
+`has_metadata=false` ⟹ no metadata accessor appended ⟹ existing programs bit-identical (all other
+ring-attention callers unaffected; verified by the scalar regression tests).
+
+**Step 2 — `kv_actual_isl` / `logical_n` → `metadata[1]` (+ chunk_size_global). IN PROGRESS (the hard one).**
+PIVOTAL CONSTRAINT: the **compute** kernel reads `logical_nt`, the 4 q-mapping tiles, and
+`active_ring_iter_mask` as runtime args (`ring_joint_sdpa.cpp` lines ~116-121) and **cannot NoC-read
+DRAM** — so it cannot read metadata itself. Therefore the broadcast design is REQUIRED (not optional):
+the **SDPA reader** reads `actual_start` from `metadata[1]`, computes all derived values on-device, and
+hands them to the writer + compute via a shared L1 region + a semaphore.
+
+Per-chunk input is just `kv_actual_isl` → `logical_n = kv_actual_isl + chunk_global` → `logical_nt =
+div_up(logical_n, 32)`; everything else is a pure function of `logical_nt` + static config:
+- `logical_nt` — consumed by reader, writer, compute.
+- `build_kv_pad_q_mapping` (factory `:257-305`) → 4 tiles (q_pre_wrap_start/count, q_post_wrap_start,
+  q_valid_count) — consumed by **compute** (runtime args 117-120).
+- `build_ring_work_plan_impl` (factory `:192-242`) → `active_ring_iter_mask` (reader/writer/compute) +
+  `single_valid_kv_chunk_mask` (writer). Uses `RingIdSequencer` (shared device-usable struct in
+  `ring_id_sequencer.hpp`) + `kv_global_tile_for_host_ring_plan` (`:174` → `chunked_kv_global_tile_for_local`
+  in `chunked_prefill_utils.hpp`) compared against `logical_nt`.
+- all-gather `gather_valid_Ht = ceil(logical_n/chunk_global) * (n_local_q/32)` — recomputed in the
+  all-gather reader (already reads metadata for the slot).
+
+Plan: (1) new shared device header porting `compute_logical_nt` + `build_kv_pad_q_mapping_device` +
+`build_ring_work_masks_device` (the static derivation params — k_chunk_tile_count, kv_local_padded_Nt,
+num_local_k_chunks, q_chunk_group_tile_count, q_local_padded_Nt, num_joint_k_chunks, joint_seq_len,
+kernel_chunked, kv_pad_rotation_enabled, kernel_is_causal, device_index, is_balanced — pass as the
+reader's compile args). (2) Reader: read metadata[1], compute, write ~8 u32 to an L1 scratch CB, inc a
+new "derived-ready" semaphore. (3) Writer + compute: wait the semaphore, read the values from the L1 CB
+instead of their runtime args. (4) Host: alloc the L1 CB + semaphore; on metadata path stop pushing the
+derived runtime args and don't require the kv_actual_isl scalar. (5) Test: drop `kv_actual_isl` from
+`META_PATH_HOST_SCALARS` + add the rotation scenarios (aligned_min / midchip_straddle / lastchip /
+rot_partial / multislab / allfull). This is a 3-kernel synchronized handoff — the most delicate change;
+a sync bug hangs the device (recover `tt-smi -glx_reset`).
 
 ## Implementation pattern (shared by all three done ops)
 
