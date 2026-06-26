@@ -93,6 +93,10 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     // single-slot gather offset from slot_id = metadata[0] on-device, so a captured trace replays across
     // cache slots. metadata is the runner's [slot_id, actual_start, actual_end] uint32 DRAM tensor.
     // std::nullopt => take the host input_batch_base (default; existing callers unaffected).
-    std::optional<Tensor> metadata = std::nullopt);
+    std::optional<Tensor> metadata = std::nullopt,
+    // Per-device Q slab in tiles (metadata path only): lets the reader recompute the gather extent
+    // (gather_valid_Ht) from metadata[1] on-device, so the gather stays bounded even when the host
+    // logical_n is a placeholder. Unused when metadata is absent.
+    uint32_t chunk_local_tiles = 0);
 
 }  // namespace ttnn

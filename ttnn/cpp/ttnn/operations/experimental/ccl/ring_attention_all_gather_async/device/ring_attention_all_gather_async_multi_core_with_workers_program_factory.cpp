@@ -126,7 +126,8 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     ttnn::ccl::CoreAllocationStrategy core_allocation_strategy,
     std::optional<uint32_t> input_batch_slice_idx,
     std::optional<uint32_t> gather_valid_Ht,
-    std::optional<Tensor> metadata) {
+    std::optional<Tensor> metadata,
+    uint32_t chunk_local_tiles) {
     using tt::tt_metal::CBDescriptor;
     using tt::tt_metal::CBFormatDescriptor;
     using tt::tt_metal::KernelDescriptor;
@@ -546,9 +547,11 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
         for (uint32_t input_idx = 0; input_idx < num_inputs; input_idx++) {
             reader_forward_rt_args.push_back(output_tensor[input_idx].buffer());
         }
-        // Metadata DRAM address (read by the reader before the optional signaler args; metadata path only).
+        // Metadata DRAM address + chunk_local_tiles (read by the reader before the optional signaler args;
+        // metadata path only). chunk_local_tiles lets the reader recompute the gather extent on-device.
         if (has_metadata) {
             reader_forward_rt_args.push_back(metadata->buffer());
+            reader_forward_rt_args.push_back(chunk_local_tiles);
         }
         if (fuse_op) {
             std::vector<uint32_t> reader_forward_signaler_args;
@@ -572,6 +575,7 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
         }
         if (has_metadata) {
             reader_backward_rt_args.push_back(metadata->buffer());
+            reader_backward_rt_args.push_back(chunk_local_tiles);
         }
         if (fuse_op) {
             std::vector<uint32_t> reader_backward_signaler_args;

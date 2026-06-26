@@ -171,9 +171,27 @@ void kernel_main() {
         meta_noc.async_read_barrier();
         CoreLocalMem<volatile uint32_t> meta(cb_meta.get_write_ptr());
         const uint32_t slot_id = meta[0];
+        // chunk_local_tiles (per-device Q slab in tiles) arrives as the next runtime arg, used to
+        // recompute the gather extent on-device (so the gather moves only the logical_n-valid prefix
+        // even when the host logical_n is a placeholder -- the runner passes only the metadata tensor).
+        const uint32_t chunk_local_tiles = get_arg_val<uint32_t>(arg_idx++);
+        const uint32_t kv_actual = meta[1];  // metadata[1] = actual_start = kv_actual_isl (tile-aligned)
+        // gather_valid_Ht = ceil(logical_n / chunk_global) * chunk_local_tiles, mirroring the host
+        // compute_gather_valid_Ht. logical_nt = kv_actual/32 + chunk_global_tiles; chunk_global_tiles =
+        // chunk_local_tiles * ring_size. TILE_HEIGHT = 32.
+        const uint32_t chunk_global_tiles = chunk_local_tiles * ring_size;
+        const uint32_t logical_nt_local = (kv_actual >> 5) + chunk_global_tiles;
+        const uint32_t valid_slabs = (logical_nt_local + chunk_global_tiles - 1) / chunk_global_tiles;
+        const uint32_t gather_valid_Ht = valid_slabs * chunk_local_tiles;
         for (uint32_t input_idx = 0; input_idx < num_inputs; input_idx++) {
             input_batch_base[input_idx] =
                 slot_id * input_batch_head_count[input_idx] * input_tensor_Ht[input_idx] * input_tensor_Wt[input_idx];
+            const uint32_t valid_Ht =
+                gather_valid_Ht < input_tensor_Ht[input_idx] ? gather_valid_Ht : input_tensor_Ht[input_idx];
+            const uint32_t valid_pages = valid_Ht * input_tensor_Wt[input_idx];
+            if (valid_pages < input_tile_id_end[input_idx]) {
+                input_tile_id_end[input_idx] = valid_pages;
+            }
         }
     }
 

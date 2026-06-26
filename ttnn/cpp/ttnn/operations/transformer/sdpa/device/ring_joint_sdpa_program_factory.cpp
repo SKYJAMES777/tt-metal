@@ -2510,7 +2510,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         // dispatch moves only kv_actual-sized data, not the whole oversized cache. Re-patched per
         // dispatch on cache hits in apply_ring_joint_scalar_runtime_args.
         compute_gather_valid_Ht(args, tensor_args),
-        tensor_args.metadata);
+        tensor_args.metadata,
+        // chunk_local_tiles: per-device Q slab in tiles, for the reader's on-device gather-extent recompute.
+        tensor_args.input_q.padded_shape()[2] / tt::constants::TILE_HEIGHT);
 
     return desc;
 }
