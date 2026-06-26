@@ -1377,7 +1377,11 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         compile_time_kv_pad_q_mapping.q_valid_tile_count,
         compile_time_active_ring_iter_mask,
         compile_time_last_active_ring_iter,
-        static_cast<uint32_t>(v_shares_k_buffer)};
+        static_cast<uint32_t>(v_shares_k_buffer),
+        // Trace-safe KV-pad derivation: when set, compute reads logical_nt / q-mapping /
+        // active_ring_iter_mask from cb_kv_pad_derived (produced by the reader) instead of its runtime
+        // args, so a captured trace replays across chunks. New compute fixed slot -> cb_arg_offset += 1.
+        static_cast<uint32_t>(kv_pad_from_metadata)};
 
     std::map<std::string, std::string> defines;
     defines["STATS_GRANULARITY"] = std::to_string(stats_granularity);
@@ -1495,10 +1499,31 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t cb_kv_pad_derived = allocate_cb(64, 1, tt::DataFormat::UInt32);
 
     const std::vector<uint32_t> cb_compile_time_args = {
-        cb_q_in,     cb_k_in,     cb_v_in,         cb_mask_in,       cb_scale_in,    cb_identity_scale_in,
-        cb_stats_in, cb_prev_out, cb_col_identity, cb_recip_scratch, cb_sum_out,     cb_sum_in,
-        cb_signal,   cb_out,      cb_stats_out,    cb_qk_im,         cb_out_im_A,    cb_out_im_B,
-        cb_max_A,    cb_max_B,    cb_sum_A,        cb_sum_B,         cb_exp_max_diff};
+        cb_q_in,
+        cb_k_in,
+        cb_v_in,
+        cb_mask_in,
+        cb_scale_in,
+        cb_identity_scale_in,
+        cb_stats_in,
+        cb_prev_out,
+        cb_col_identity,
+        cb_recip_scratch,
+        cb_sum_out,
+        cb_sum_in,
+        cb_signal,
+        cb_out,
+        cb_stats_out,
+        cb_qk_im,
+        cb_out_im_A,
+        cb_out_im_B,
+        cb_max_A,
+        cb_max_B,
+        cb_sum_A,
+        cb_sum_B,
+        cb_exp_max_diff,
+        // index 23: compute reads the reader-produced KV-pad scalars from here (cb_arg_offset + 23).
+        cb_kv_pad_derived};
     const std::vector<uint32_t> reader_cb_compile_time_args = {cb_q_in, cb_k_in, cb_v_in, cb_kv_pad_derived};
     reader_compile_time_args.insert(
         reader_compile_time_args.end(), reader_cb_compile_time_args.begin(), reader_cb_compile_time_args.end());
