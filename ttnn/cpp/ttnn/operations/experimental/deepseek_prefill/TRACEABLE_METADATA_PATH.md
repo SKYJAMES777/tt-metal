@@ -91,6 +91,33 @@ div_up(logical_n, 32)`; everything else is a pure function of `logical_nt` + sta
 - all-gather `gather_valid_Ht = ceil(logical_n/chunk_global) * (n_local_q/32)` — recomputed in the
   all-gather reader (already reads metadata for the slot).
 
+DONE so far (committed): the device derivation header (`ring_joint_kv_pad_derivation.hpp`) and the host
+rotation-enablement (`kv_pad_rotation_enabled = has_kv_pad_rotation() || (has_metadata() && is_chunked())`,
+host q-mapping guarded on `kv_actual_isl.has_value()`, `compute_gather_valid_Ht` gate widened,
+`kv_pad_from_metadata` local marked `[[maybe_unused]]`). No regression.
+
+EXACT RESUME SPECIFICS for the kernel sync wiring (verified by inspection):
+- Producer CB: add `cb_kv_pad_derived = allocate_cb(64, 1, UInt32)` (factory ~line 1441 area, via the
+  `allocate_cb` lambda); append its id to `reader_cb_compile_time_args` (reader reads it at
+  `cb_arg_offset + 3`) AND to `cb_compile_time_args` (compute reads it at `cb_arg_offset + 23`;
+  compute `cb_arg_offset = 49`).
+- `kv_pad_from_metadata` compile flag: reader add at fixed slot 33 (bump reader accessors `TensorAccessorArgs<33>` → `<34>`, which auto-shifts meta_args + chains_base_offset); writer + compute add at the end of their fixed compile-arg lists (bump their cb_arg_offset by 1).
+- Reader ring params for `build_ring_work_masks_device`: `fused_op_receiver.seq.{ring_index, ring_size,
+  expected[0]=backward, expected[1]=forward}` (constructed at reader line ~277, before the metadata read).
+  chunk_global = `q_chunk_group_tile_count * 32`; kv_actual_tile_count = `metadata[1] / 32`.
+- Reader: when kv_pad_from_metadata, read metadata[1] (already reads metadata[0] for slot), compute
+  logical_nt/masks/q-mapping, override its own `logical_nt`+`active_ring_iter_mask` (mutable, lines
+  275-276), and `cb_reserve_back`+write 6 u32+`cb_push_back` to cb_kv_pad_derived.
+- Compute: when flag, `cb_wait_front(cb_kv_pad_derived,1)`, read 6 u32 via
+  `reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb))`, override its rt-arg
+  logical_nt/q-mapping/active_ring_iter_mask (lines 116-121), `cb_pop_front(1)`.
+- Writer: when flag, re-read metadata[1] (needs metadata addr via emplace_common_runtime_args like the
+  reader), recompute logical_nt + masks, override (lines 453-455).
+- All-gather gather_valid_Ht on-device: DEFER (host value correct for the non-trace bit-exact test;
+  needed only for actual trace replay).
+- Test: rotation scenarios; metadata path passes kv_actual_isl=None (host can't compute q-mapping →
+  kernels must → discriminating).
+
 Plan: (1) new shared device header porting `compute_logical_nt` + `build_kv_pad_q_mapping_device` +
 `build_ring_work_masks_device` (the static derivation params — k_chunk_tile_count, kv_local_padded_Nt,
 num_local_k_chunks, q_chunk_group_tile_count, q_local_padded_Nt, num_joint_k_chunks, joint_seq_len,

@@ -10,6 +10,7 @@
 #include "api/core_local_mem.h"
 #include "dataflow_common.hpp"
 #include "chunked_prefill_utils.hpp"
+#include "ring_joint_kv_pad_derivation.hpp"
 #include "chain_link.hpp"
 #include "fused_op_receiver.hpp"
 #include "ttnn/operations/transformer/sdpa/device/kernels/ring_joint_chain_layout.hpp"
@@ -216,7 +217,11 @@ void kernel_main() {
     // (common runtime arg 0) instead of the per-core runtime arg, so a captured trace replays across
     // cache slots. Tensor accessors therefore start at compile-arg slot 33.
     constexpr bool slot_from_metadata = get_compile_time_arg_val(32) == 1;
-    constexpr auto q_args = TensorAccessorArgs<33>();
+    // Slot 33: trace-safe KV-pad derivation. When set, the reader reads kv_actual_isl from metadata[1],
+    // derives logical_nt / q-mapping / ring masks on-device, and hands the compute-needed values to the
+    // compute kernel via cb_kv_pad_derived (compute cannot NoC-read the metadata DRAM tensor).
+    constexpr bool kv_pad_from_metadata = get_compile_time_arg_val(33) == 1;
+    constexpr auto q_args = TensorAccessorArgs<34>();
     constexpr auto k_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto gathered_k_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
@@ -226,10 +231,10 @@ void kernel_main() {
         get_post_tensor_args_offset<has_joint_inputs, joint_tensor_args_offset>();
     // The metadata accessor (metadata path only) follows the tensor accessors and precedes the chain
     // semaphore compile args. Gate its offset on slot_from_metadata: when absent, fall back to a VALID
-    // (unused) accessor offset (q_args' slot 33) so TensorAccessorArgs<> -- instantiated unconditionally
+    // (unused) accessor offset (q_args' slot 34) so TensorAccessorArgs<> -- instantiated unconditionally
     // here -- never names a non-accessor compile arg (which would fail its internal static_assert).
     // The chain/CB compile args then start after the metadata accessor when present.
-    constexpr uint32_t meta_args_offset = slot_from_metadata ? post_tensor_args_offset : 33;
+    constexpr uint32_t meta_args_offset = slot_from_metadata ? post_tensor_args_offset : 34;
     constexpr auto meta_args = TensorAccessorArgs<meta_args_offset>();
     constexpr uint32_t chains_base_offset =
         slot_from_metadata ? meta_args.next_compile_time_args_offset() : post_tensor_args_offset;
@@ -272,8 +277,9 @@ void kernel_main() {
         gqa_max_q_per_core = get_arg_val<uint32_t>(argidx++);
     }
 
-    const uint32_t logical_nt = get_arg_val<uint32_t>(argidx++);
-    const uint32_t active_ring_iter_mask = get_arg_val<uint32_t>(argidx++);
+    // Mutable: on the kv_pad_from_metadata path these are recomputed on-device below from metadata[1].
+    uint32_t logical_nt = get_arg_val<uint32_t>(argidx++);
+    uint32_t active_ring_iter_mask = get_arg_val<uint32_t>(argidx++);
     RingSDPAOpReceiver fused_op_receiver = RingSDPAOpReceiver(
         true, /* wait_for_op_signal */
         argidx);
@@ -347,7 +353,7 @@ void kernel_main() {
     // between the tensor accessors and the chain semaphores. Read into cb_q_in's L1 as scratch -- it is
     // allocated but not yet filled here, and the main loop overwrites it before first use. (A NoC read
     // into a kernel stack buffer hangs; the destination must be a real L1 CB address.)
-    if constexpr (slot_from_metadata) {
+    if constexpr (slot_from_metadata || kv_pad_from_metadata) {
         const uint32_t metadata_addr = get_common_arg_val<uint32_t>(0);
         const auto s_meta = TensorAccessor(meta_args, metadata_addr);
         Noc meta_noc;
@@ -356,7 +362,53 @@ void kernel_main() {
         meta_noc.async_read(s_meta, CoreLocalMem<uint32_t>(meta_l1), 16, {.page_id = 0}, {});
         meta_noc.async_read_barrier();
         CoreLocalMem<volatile uint32_t> meta(meta_l1);
-        kv_cache_batch_idx = meta[0];
+        if constexpr (slot_from_metadata) {
+            kv_cache_batch_idx = meta[0];  // metadata[0] = slot_id
+        }
+        if constexpr (kv_pad_from_metadata) {
+            // metadata[1] = actual_start = kv_actual_isl (tile-aligned). Derive the per-chunk values the
+            // host would otherwise have computed from the kv_actual_isl scalar, and hand the
+            // compute-needed subset to the compute kernel via cb_kv_pad_derived (compute can't NoC-read
+            // DRAM). chunk_size_t == q_chunk_group_tile_count (ring_size * q_local_padded_Nt).
+            const uint32_t kv_actual_isl = meta[1];
+            const uint32_t kv_actual_tile_count = kv_actual_isl / 32;
+            const uint32_t chunk_global = chunk_size_t * 32;
+            logical_nt = ring_joint::compute_logical_nt(kv_actual_isl, chunk_global, 32);
+            const auto qmap = ring_joint::build_kv_pad_q_mapping_device(
+                kv_actual_tile_count, logical_nt, ring_size, q_local_padded_Nt, fused_op_receiver.seq.ring_index);
+            const auto masks = ring_joint::build_ring_work_masks_device(
+                fused_op_receiver.seq.ring_index,
+                ring_size,
+                fused_op_receiver.seq.expected[0],  // backward_writes_expected
+                fused_op_receiver.seq.expected[1],  // forward_writes_expected
+                num_local_k_chunks,
+                Sk_chunk_t,
+                kv_local_padded_Nt,
+                chunked_enabled,
+                chunk_size_t,
+                q_local_padded_Nt,
+                logical_nt,
+                num_joint_k_chunks,
+                L,
+                kv_pad_rotation_enabled,
+                is_causal != 0,
+                is_balanced != 0);
+            active_ring_iter_mask = masks.active_ring_iter_mask;
+
+            // Hand [logical_nt, q_pre_wrap_start, q_pre_wrap_count, q_post_wrap_start, q_valid_count,
+            // active_ring_iter_mask] to compute via cb_kv_pad_derived (cb_arg_offset + 3).
+            constexpr uint32_t cb_kv_pad_derived = get_compile_time_arg_val(cb_arg_offset + 3);
+            CircularBuffer cb_derived(cb_kv_pad_derived);
+            cb_derived.reserve_back(1);
+            CoreLocalMem<volatile uint32_t> d(cb_derived.get_write_ptr());
+            d[0] = logical_nt;
+            d[1] = qmap.q_pre_wrap_start_tile;
+            d[2] = qmap.q_pre_wrap_tile_count;
+            d[3] = qmap.q_post_wrap_start_tile;
+            d[4] = qmap.q_valid_tile_count;
+            d[5] = active_ring_iter_mask;
+            cb_derived.push_back(1);
+        }
     }
 
     constexpr uint32_t q_tile_bytes = get_tile_size(cb_q_in);

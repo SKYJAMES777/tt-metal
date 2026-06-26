@@ -1191,6 +1191,10 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         // Slot 32: trace-safe slot select. When set, the reader reads kv_cache_batch_idx from
         // metadata[0] on-device (common runtime arg 0) instead of the per-core kv_cache_batch_idx arg.
         static_cast<uint32_t>(slot_from_metadata),
+        // Slot 33: trace-safe KV-pad derivation. When set, the reader reads kv_actual_isl from
+        // metadata[1], derives logical_nt / q-mapping / ring masks on-device, overrides its own
+        // logical_nt+active_ring_iter_mask, and pushes the compute-needed values to cb_kv_pad_derived.
+        static_cast<uint32_t>(kv_pad_from_metadata),
     };
 
     TensorAccessorArgs(input_tensor_q.buffer()).append_to(reader_compile_time_args);
@@ -1484,12 +1488,18 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t cb_signal =
         use_streaming_compute ? allocate_cb(signal_page_size, 1, tt::DataFormat::UInt16) : inactive_cb;
 
+    // Trace-safe KV-pad path: 1-page L1 CB the reader uses to hand the on-device-derived per-chunk
+    // scalars (logical_nt, 4 q-mapping tiles, active_ring_iter_mask) to the compute kernel, which cannot
+    // NoC-read the metadata DRAM tensor itself. Allocated unconditionally (tiny); only used when
+    // kv_pad_from_metadata. 64B page holds the 6 uint32 with headroom.
+    const uint32_t cb_kv_pad_derived = allocate_cb(64, 1, tt::DataFormat::UInt32);
+
     const std::vector<uint32_t> cb_compile_time_args = {
         cb_q_in,     cb_k_in,     cb_v_in,         cb_mask_in,       cb_scale_in,    cb_identity_scale_in,
         cb_stats_in, cb_prev_out, cb_col_identity, cb_recip_scratch, cb_sum_out,     cb_sum_in,
         cb_signal,   cb_out,      cb_stats_out,    cb_qk_im,         cb_out_im_A,    cb_out_im_B,
         cb_max_A,    cb_max_B,    cb_sum_A,        cb_sum_B,         cb_exp_max_diff};
-    const std::vector<uint32_t> reader_cb_compile_time_args = {cb_q_in, cb_k_in, cb_v_in};
+    const std::vector<uint32_t> reader_cb_compile_time_args = {cb_q_in, cb_k_in, cb_v_in, cb_kv_pad_derived};
     reader_compile_time_args.insert(
         reader_compile_time_args.end(), reader_cb_compile_time_args.begin(), reader_cb_compile_time_args.end());
     writer_compile_time_args.insert(
