@@ -355,6 +355,8 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
         1,                                        // direction
         unicast_backward_args[0],                 // unicast route arg0 (dst_mesh_id or 0)
         unicast_backward_args[1],                 // unicast route arg1 (dst_chip_id or distance_in_hops)
+        static_cast<uint32_t>(has_metadata),      // 16 == has_metadata (trace-safe gather-extent recompute)
+        meta_cb_index,                            // 17 == cb_meta_id
     };
     for (uint32_t i = 0; i < num_inputs; i++) {
         sender_writer_forward_kernel.compile_time_args.push_back(op_config.get_page_size());
@@ -362,6 +364,9 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     for (uint32_t i = 0; i < num_inputs; i++) {
         tt::tt_metal::TensorAccessorArgs(output_tensor[i].buffer())
             .append_to(sender_writer_forward_kernel.compile_time_args);
+    }
+    if (has_metadata) {
+        tt::tt_metal::TensorAccessorArgs(metadata->buffer()).append_to(sender_writer_forward_kernel.compile_time_args);
     }
 
     // Backward Direction
@@ -428,6 +433,8 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
         0,                                         // direction
         unicast_forward_args[0],                   // unicast route arg0 (dst_mesh_id or 0)
         unicast_forward_args[1],                   // unicast route arg1 (dst_chip_id or distance_in_hops)
+        static_cast<uint32_t>(has_metadata),       // 16 == has_metadata (trace-safe gather-extent recompute)
+        meta_cb_index,                             // 17 == cb_meta_id
     };
     for (uint32_t i = 0; i < num_inputs; i++) {
         sender_writer_backward_kernel.compile_time_args.push_back(op_config.get_page_size());
@@ -435,6 +442,9 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     for (uint32_t i = 0; i < num_inputs; i++) {
         tt::tt_metal::TensorAccessorArgs(output_tensor[i].buffer())
             .append_to(sender_writer_backward_kernel.compile_time_args);
+    }
+    if (has_metadata) {
+        tt::tt_metal::TensorAccessorArgs(metadata->buffer()).append_to(sender_writer_backward_kernel.compile_time_args);
     }
 
     /* All gather fusion */
@@ -602,6 +612,12 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
         for (uint32_t input_idx = 0; input_idx < num_inputs; input_idx++) {
             writer_forward_rt_args.push_back(output_tensor[input_idx].buffer());
         }
+        // Metadata DRAM address + chunk_local_tiles (read by the writer after the output-buffer addrs and
+        // before the fabric args; metadata path only) for the on-device gather-extent recompute.
+        if (has_metadata) {
+            writer_forward_rt_args.push_back(metadata->buffer());
+            writer_forward_rt_args.push_back(chunk_local_tiles);
+        }
         writer_forward_rt_args.push_back(0u);
         writer_forward_rt_args.push_back(static_cast<uint32_t>(backward_device_coord.has_value()));
         // Fabric/signaler helpers expect std::vector<uint32_t>&; collect their args separately,
@@ -637,6 +653,10 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
         writer_backward_rt_args.append(tensor_descriptor_args);
         for (uint32_t input_idx = 0; input_idx < num_inputs; input_idx++) {
             writer_backward_rt_args.push_back(output_tensor[input_idx].buffer());
+        }
+        if (has_metadata) {
+            writer_backward_rt_args.push_back(metadata->buffer());
+            writer_backward_rt_args.push_back(chunk_local_tiles);
         }
         writer_backward_rt_args.push_back(static_cast<uint32_t>(forward_device_coord.has_value()));
         std::vector<uint32_t> writer_backward_extra_args;
