@@ -235,10 +235,11 @@ def run_falcon_demo_kv(
     logger.info("Loading weights...")
     profiler.start("loading_weights")
 
-    hugging_face_reference_model = FalconForCausalLM.from_pretrained(
-        model_version, local_files_only=os.getenv("CI") == "true", low_cpu_mem_usage=True
-    )
-    hugging_face_reference_model.eval()
+    # transformers 5.x silently fails to populate the vendored Falcon via from_pretrained
+    # (see #47924). load_falcon_reference_model reads the raw checkpoint in native layout.
+    from models.demos.t3000.falcon40b.tests.test_utils import load_falcon_reference_model
+
+    hugging_face_reference_model = load_falcon_reference_model(model_version)
     state_dict = hugging_face_reference_model.state_dict()
 
     profiler.end("loading_weights")
