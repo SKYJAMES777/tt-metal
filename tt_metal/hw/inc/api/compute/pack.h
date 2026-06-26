@@ -30,6 +30,7 @@ namespace ckernel {
  */
 // clang-format on
 ALWI void pack_init(uint32_t ocb, uint32_t call_line = __builtin_LINE()) {
+    LLK_SAN_FUNCTION();
     state_configure<Operand::PACK>(ocb, call_line);
     PACK((llk_pack_init(ocb)));
 }
