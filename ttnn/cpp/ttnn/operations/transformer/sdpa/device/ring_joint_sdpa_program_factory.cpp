@@ -357,7 +357,9 @@ RingJointRuntimeDerivation build_runtime_derivation(
     // Cross is non-causal on chunked-shaped tensors, so kernels and the work planner use the
     // non-chunked path.
     derivation.kernel_chunked = tensor_args.is_chunked() && !args.is_cross;
-    derivation.kv_pad_rotation_enabled = args.has_kv_pad_rotation();
+    // Metadata path enables rotation on the chunked case too (kv_actual read on-device from metadata[1]).
+    derivation.kv_pad_rotation_enabled =
+        args.has_kv_pad_rotation() || (tensor_args.has_metadata() && tensor_args.is_chunked());
     derivation.kernel_is_causal = args.is_causal && !derivation.kernel_chunked;
 
     TT_FATAL(
@@ -377,9 +379,11 @@ RingJointRuntimePlan build_runtime_plan(
 
     RingJointRuntimePlan plan;
     plan.logical_nt = derivation.logical_nt;
+    // On the metadata path kv_actual_isl is absent and the q-mapping is computed on-device from
+    // metadata[1]; only the scalar path computes it host-side here.
     const uint32_t kv_actual_tile_count =
-        derivation.kv_pad_rotation_enabled ? args.kv_actual_isl.value() / tt::constants::TILE_HEIGHT : 0;
-    if (derivation.kv_pad_rotation_enabled) {
+        args.kv_actual_isl.has_value() ? args.kv_actual_isl.value() / tt::constants::TILE_HEIGHT : 0;
+    if (args.kv_actual_isl.has_value()) {
         plan.kv_pad_q_mapping = build_kv_pad_q_mapping(
             kv_actual_tile_count,
             derivation.logical_nt,
@@ -403,7 +407,7 @@ RingJointRuntimeValues build_runtime_values(
 
     RingJointRuntimeValues values;
     values.logical_nt = derivation.logical_nt;
-    if (derivation.kv_pad_rotation_enabled) {
+    if (args.kv_actual_isl.has_value()) {
         const uint32_t kv_actual_tile_count = args.kv_actual_isl.value() / tt::constants::TILE_HEIGHT;
         values.kv_pad_q_mapping = build_kv_pad_q_mapping(
             kv_actual_tile_count,
@@ -467,7 +471,8 @@ void write_runtime_arg(RuntimeArgsData& args, uint32_t index, uint32_t value, co
 // dispatch is bounded) and the cache-hit override path.
 std::optional<uint32_t> compute_gather_valid_Ht(
     const ttnn::prim::RingJointSDPAParams& args, const ttnn::prim::RingJointSDPAInputs& tensor_args) {
-    if (!args.has_kv_pad_rotation()) {
+    // Bound the gather whenever rotation is active -- scalar kv_actual_isl or the chunked metadata path.
+    if (!args.has_kv_pad_rotation() && !(tensor_args.has_metadata() && tensor_args.is_chunked())) {
         return std::nullopt;
     }
     const uint32_t ring_size = static_cast<uint32_t>(args.all_gather_operation_attributes.ring_size);
@@ -804,7 +809,12 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t Lt = tt::div_up(L, tt::constants::TILE_HEIGHT);
     const uint32_t DHt = DH / tt::constants::TILE_WIDTH;
     const uint32_t vDHt = vDH / tt::constants::TILE_WIDTH;
-    const bool kv_pad_rotation_enabled = args.has_kv_pad_rotation();
+    // Rotation is enabled by a host kv_actual_isl scalar OR by the trace-safe metadata path (chunked
+    // only -- `&& is_chunked()` keeps the non-rotation indexed-cache metadata case off). On the metadata
+    // path the per-chunk derived values (logical_nt / q-mapping / masks) are computed in the kernels from
+    // metadata[1]; kv_pad_from_metadata gates that on-device derivation.
+    [[maybe_unused]] const bool kv_pad_from_metadata = tensor_args.has_metadata() && tensor_args.is_chunked();
+    const bool kv_pad_rotation_enabled = args.has_kv_pad_rotation() || kv_pad_from_metadata;
     const RingJointRuntimePlan runtime_plan = build_runtime_plan(args, tensor_args, ring_write_plan);
     const RingJointRuntimeArgLayout runtime_arg_layout = get_runtime_arg_layout(args, tensor_args);
     const uint32_t logical_nt = runtime_plan.logical_nt;
