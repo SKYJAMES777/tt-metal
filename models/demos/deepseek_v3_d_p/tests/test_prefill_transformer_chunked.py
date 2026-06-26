@@ -582,6 +582,7 @@ def run_chunked_transformer_no_pcc(
     routing_use_l1_small_for_semaphores=False,
     use_trace=False,
     verify_kv_cache_pcc=False,
+    use_metadata=False,
 ):
     """No-PCC perf/smoke variant of run_chunked_transformer: build the transformer ONCE (with
     kv_only_last_layer=True so the LM head + sampling tail is never built/run — the populated KV cache
@@ -709,7 +710,121 @@ def run_chunked_transformer_no_pcc(
 
     mesh_device.enable_program_cache()
 
-    if use_trace:
+    # Per-chunk replay timings (metadata trace path only); surfaced in the perf JSON below.
+    per_chunk_seconds = []
+
+    if use_trace and use_metadata:
+        # ---------------------- METADATA MULTI-CHUNK TRACE PATH (N chunks) ----------------------
+        # Capture the forward ONCE, then replay it for every chunk. The per-chunk scalars
+        # (slot/actual_start/actual_end) are NOT baked into the captured command stream — the trace-safe
+        # MLA ops read them on-device from a persistent metadata DRAM tensor. So advancing chunks is just
+        # an in-place host->device update of two persistent buffers (token input + metadata) between
+        # replays; the same captured trace produces the correct KV for each chunk. This is the real
+        # end-to-end trace-safety validation across multiple chunks.
+
+        # Persistent buffers — created ONCE, never reallocated, so the addresses the trace captured stay
+        # valid across all execute_trace calls. (Re-running from_torch(device=...) per chunk would
+        # reallocate and the replayed program would read a stale/freed address.)
+        trace_input = ttnn.from_torch(
+            chunk_tok_host[0],
+            device=mesh_device,
+            dtype=ttnn.uint32,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_shape), dims=(0, None)),
+        )
+        # Replicated uint32 [slot_id, actual_start, actual_end, 0] — the runner's h2d_socket_sync payload
+        # (trailing 0 pads to 4 words). Seeded with chunk 0's values; updated in-place per chunk.
+        trace_metadata = ttnn.from_torch(
+            torch.tensor([0, 0, CHUNK, 0], dtype=torch.int64).reshape(1, 1, 1, 4),
+            device=mesh_device,
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+        )
+
+        # Pre-build the per-chunk HOST tensors (no device=) used for the cheap in-place updates: the
+        # SP-sharded token tile and the [0, c*CHUNK, c*CHUNK+CHUNK, 0] metadata for each chunk.
+        tok_host_tt = [
+            ttnn.from_torch(
+                chunk_tok_host[c],
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_shape), dims=(0, None)),
+            )
+            for c in range(n_chunks)
+        ]
+        meta_host_tt = [
+            ttnn.from_torch(
+                torch.tensor([0, c * CHUNK, c * CHUNK + CHUNK, 0], dtype=torch.int64).reshape(1, 1, 1, 4),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+            )
+            for c in range(n_chunks)
+        ]
+
+        def _forward_meta():
+            # actual_start/actual_end = None: every per-chunk scalar comes from `metadata` on-device.
+            transformer.forward(
+                trace_input,
+                tt_kvpe_cache,
+                number_of_non_padded_tokens=CHUNK,
+                actual_start=None,
+                actual_end=None,
+                cache_user_id=0,
+                metadata=trace_metadata,
+                return_intermediates=False,
+            )
+
+        controller = SubDeviceTraceController(mesh_device)
+        transformer.set_trace_controller(controller)
+
+        # Warmup/compile pass (controller idle): populates the program cache for the METADATA op variants
+        # (different program hash than the scalar ops) BEFORE capture.
+        _forward_meta()
+        ttnn.synchronize_device(mesh_device)
+
+        logger.info(f"[trace] capturing {num_layers}-layer forward (metadata path, overlap on)...")
+        controller.begin_capture()
+        _forward_meta()
+        controller.end_capture()
+        ttnn.synchronize_device(mesh_device)
+
+        trace_bytes = controller.trace_bytes()
+        logger.info(
+            f"[trace] {num_layers}-layer forward = {controller.num_segments} trace segments, "
+            f"{trace_bytes / (1024 * 1024):.2f} MB ({trace_bytes:,} bytes)"
+        )
+
+        # Replay across all chunks: update the persistent token + metadata buffers in-place (cq 0), then
+        # replay (execute_trace cq_id=0, blocking — ordered after the copies). One captured trace, N chunks.
+        signpost("PROFILE_MEASURE_START")
+        per_iter_seconds = []
+        profiler.start("tt_forward")
+        for it in range(num_iters):
+            iter_start = time.time()
+            for c in range(n_chunks):
+                ttnn.copy_host_to_device_tensor(tok_host_tt[c], trace_input)
+                ttnn.copy_host_to_device_tensor(meta_host_tt[c], trace_metadata)
+                chunk_start = time.time()
+                controller.replay()
+                ttnn.synchronize_device(mesh_device)
+                dt = time.time() - chunk_start
+                per_chunk_seconds.append(dt)
+                logger.info(f"  iter {it} chunk {c} (trace replay): {dt:.3f} seconds")
+            iter_seconds = time.time() - iter_start
+            per_iter_seconds.append(iter_seconds)
+            logger.info(f"iter {it} done ({n_chunks} chunks via trace) in {iter_seconds:.3f} seconds")
+        profiler.end("tt_forward")
+        signpost("PROFILE_MEASURE_END")
+
+        controller.release()
+        transformer.set_trace_controller(None)
+        ttnn.deallocate(trace_input)
+        ttnn.deallocate(trace_metadata)
+    elif use_trace:
         # ----------------------------- TRACE PATH (pinned to chunk 0) -----------------------------
         # Capture the forward ONCE as a ttnn trace, then replay it every iteration with execute_trace.
         # The trace records the device command stream, so the per-op host-dispatch (op2op) gaps that
@@ -895,8 +1010,13 @@ def run_chunked_transformer_no_pcc(
                     "n_chunks": n_chunks,
                     "num_layers": num_layers,
                     "per_iter_seconds": per_iter_seconds,
+                    "per_chunk_seconds": per_chunk_seconds,
                     "avg_iter_seconds": avg_iter,
-                    "avg_per_chunk_seconds": avg_iter / n_chunks if n_chunks else 0.0,
+                    "avg_per_chunk_seconds": (
+                        sum(per_chunk_seconds) / len(per_chunk_seconds)
+                        if per_chunk_seconds
+                        else (avg_iter / n_chunks if n_chunks else 0.0)
+                    ),
                 },
                 f,
             )
@@ -1230,4 +1350,63 @@ def test_kimi_prefill_transformer_chunked_trace_kv_pcc(
         routing_use_l1_small_for_semaphores=True,
         use_trace=True,
         verify_kv_cache_pcc=True,
+    )
+
+
+# Multi-chunk trace variant: capture the forward ONCE, then replay it for ALL n_chunks chunks, advancing
+# the per-chunk scalars (slot/actual_start/actual_end) only via an in-place update of a persistent
+# metadata DRAM tensor that the trace-safe MLA ops read on-device. This is the end-to-end proof that one
+# captured trace replays correctly across chunks (the production runner's path), and the timing profile
+# (per_chunk_seconds) shows the op2op-collapsed cost per chunk. 11 chunks per the request.
+@pytest.mark.parametrize("n_chunks", [11], ids=["chunks11"])
+@pytest.mark.parametrize("num_iters", [1, 2], ids=["iters1", "two_iters"])
+@pytest.mark.parametrize("num_layers", [1, 10, 61], ids=["L1", "L10", "L61"])
+@pytest.mark.parametrize(
+    "mesh_device, device_params, num_links, topology",
+    [
+        pytest.param(
+            (8, 4),
+            {
+                "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+                "fabric_router_config": create_fabric_router_config(max_payload_size=KimiK26Config.FABRIC_PAYLOAD_SIZE),
+                "l1_small_size": 512,
+                "trace_region_size": 256 * 1024 * 1024,
+            },
+            2,
+            ttnn.Topology.Linear,
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(8, 4), topology="mesh-8x4"),
+            id="mesh-8x4",
+        ),
+    ],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["kimi_k2_6"], indirect=True, ids=["kimi"])
+@pytest.mark.skipif(not is_blackhole(), reason="Kimi requires Blackhole")
+@pytest.mark.timeout(0)
+def test_kimi_prefill_transformer_chunked_trace_multichunk(
+    variant,
+    config_only,
+    mesh_device,
+    device_params,
+    weight_cache_path,
+    num_layers,
+    num_iters,
+    n_chunks,
+    num_links,
+    topology,
+):
+    run_chunked_transformer_no_pcc(
+        variant,
+        config_only,
+        mesh_device,
+        weight_cache_path,
+        num_layers,
+        n_chunks,
+        GateComputeMode.DEVICE_FP32,
+        num_links,
+        topology,
+        num_iters=num_iters,
+        routing_use_l1_small_for_semaphores=True,
+        use_trace=True,
+        use_metadata=True,
     )

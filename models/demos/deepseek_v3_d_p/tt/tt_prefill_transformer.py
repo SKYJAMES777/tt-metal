@@ -270,6 +270,7 @@ class TtPrefillTransformer(LightweightModule):
         actual_start: Optional[int] = None,
         actual_end: Optional[int] = None,
         cache_user_id: int = 0,
+        metadata: Optional[ttnn.Tensor] = None,
     ):
         """
         Forward pass: embed -> [block x N] -> norm -> lm_head.
@@ -300,8 +301,11 @@ class TtPrefillTransformer(LightweightModule):
         # and writes this chunk at the actual_start offset of user cache_user_id's slot; the single-shot
         # path builds per-call rope for this seq_len. The norm/lm_head/sample tail still runs and a token
         # is returned, but the chunked caller ignores it (the populated cache is the output).
-        if actual_start is not None:
-            assert self.is_chunked, "actual_start requires the transformer to be built with is_chunked=True"
+        if actual_start is not None or metadata is not None:
+            # metadata path: per-chunk actual_start/actual_end live on-device in the metadata tensor
+            # (read by the trace-safe MLA ops), so actual_start is None here -- still chunked prefill,
+            # still the prebuilt whole-cache indexed rope.
+            assert self.is_chunked, "chunked prefill (actual_start or metadata) requires is_chunked=True"
             rope_tensors = self.indexed_rope
         else:
             rope_tensors = self.rope_setup.get_rope_tensors(self.seq_len)
@@ -326,6 +330,7 @@ class TtPrefillTransformer(LightweightModule):
                 actual_start=actual_start,
                 actual_end=actual_end,
                 cache_user_id=cache_user_id,
+                metadata=metadata,
             )
             signpost(f"forward_layer_{i}_end")
             if self.kv_only_last_layer and i == len(self.layers) - 1:

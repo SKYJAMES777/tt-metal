@@ -401,6 +401,7 @@ class TtPrefillBlock(LightweightModule):
         actual_end: Optional[int] = None,
         cache_user_id: int = 0,
         return_kv_intermediates: bool = False,
+        metadata: Optional[ttnn.Tensor] = None,
     ):
         """
         Args:
@@ -437,6 +438,7 @@ class TtPrefillBlock(LightweightModule):
             actual_end=actual_end,
             cache_user_id=cache_user_id,
             return_kv_intermediates=return_kv_intermediates,
+            metadata=metadata,
         )
         kv_intermediates = None
         if return_kv_intermediates:

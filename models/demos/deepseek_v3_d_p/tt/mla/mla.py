@@ -747,6 +747,7 @@ class ttMLA:
                 kv_actual_isl=actual_start,
                 actual_end=actual_end,
                 cache_user_id=cache_user_id,
+                metadata=metadata,
             )
 
         signpost(header="MLA_START")
@@ -1003,6 +1004,7 @@ class ttMLA:
         kv_actual_isl: int,
         actual_end: Optional[int],
         cache_user_id: int,
+        metadata: Optional[ttnn.Tensor] = None,
     ) -> None:
         """Last-layer fast path: fill the KV cache (which migration consumes) and fire the
         migration callback, then stop. Skips Q / SDPA / output projection entirely; the
@@ -1050,7 +1052,7 @@ class ttMLA:
 
         # Same rope as the full chunked path (indexed/padded when chunked, single-shot otherwise) so
         # the KV written to the cache carries the correct per-chunk positional offset.
-        tt_kv_rope = self._apply_rope(tt_kv_rope, rope_tensors, kv_actual_isl)
+        tt_kv_rope = self._apply_rope(tt_kv_rope, rope_tensors, kv_actual_isl, metadata=metadata)
 
         # TODO: concat rope and nope, workaround remove with ttnn.narrow or fusion
         tt_kvpe = ttnn.concat([tt_kv_nope, tt_kv_rope], dim=-1)
@@ -1060,29 +1062,51 @@ class ttMLA:
         # Write the chunk via the SAME chunked path as _chunked_attn (not a single-shot fill):
         # update_padded_kv_cache writes at the per-chip offset derived from kv_actual_global.
         chunk_size_global = seq_len_local * self.sp_factor
-        ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
-            kvpe_cache,
-            tt_kvpe,
-            slot_idx=cache_user_id,
-            layer_idx=cache_layer_idx,
-            num_layers=self.layer_num,
-            kv_actual_global=kv_actual_isl,
-            cluster_axis=self.sp_axis,
-        )
+        if metadata is not None:
+            # Trace-safe: slot_idx + kv_actual_global read on-device from the metadata tensor.
+            ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
+                kvpe_cache,
+                tt_kvpe,
+                metadata,
+                layer_idx=cache_layer_idx,
+                num_layers=self.layer_num,
+                cluster_axis=self.sp_axis,
+            )
+        else:
+            ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
+                kvpe_cache,
+                tt_kvpe,
+                slot_idx=cache_user_id,
+                layer_idx=cache_layer_idx,
+                num_layers=self.layer_num,
+                kv_actual_global=kv_actual_isl,
+                cluster_axis=self.sp_axis,
+            )
 
         # Migration-gated: zero the pad window past actual_end so the decode side reads clean zeros,
         # then fire the per-layer ack (the populated cache is the only output of a kv-only last layer).
         if on_layer_complete is not None:
-            assert actual_end is not None, "actual_end required when on_layer_complete is set"
-            ttnn.experimental.deepseek_prefill.zero_padded_kv_cache(
-                kvpe_cache,
-                cache_user_id,
-                cache_layer_idx,
-                self.layer_num,
-                actual_end,
-                chunk_size_global,
-                self.sp_axis,
-            )
+            if metadata is not None:
+                # Trace-safe: slot_idx + actual_end read on-device from the metadata tensor.
+                ttnn.experimental.deepseek_prefill.zero_padded_kv_cache(
+                    kvpe_cache,
+                    metadata,
+                    cache_layer_idx,
+                    self.layer_num,
+                    chunk_size_global,
+                    self.sp_axis,
+                )
+            else:
+                assert actual_end is not None, "actual_end required when on_layer_complete is set"
+                ttnn.experimental.deepseek_prefill.zero_padded_kv_cache(
+                    kvpe_cache,
+                    cache_user_id,
+                    cache_layer_idx,
+                    self.layer_num,
+                    actual_end,
+                    chunk_size_global,
+                    self.sp_axis,
+                )
             # ttnn.synchronize_device(self.mesh_device)
             # on_layer_complete(self.layer_idx)
 
