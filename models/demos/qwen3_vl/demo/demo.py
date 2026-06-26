@@ -375,6 +375,8 @@ def test_demo(
     reference_model = Qwen3VLForConditionalGeneration.from_pretrained(
         ref_model_name, config=config, torch_dtype="auto", device_map="auto"
     )
+    # transformers 5.x dropped the `visual` backward-compat property; it now lives under `.model`.
+    reference_visual = reference_model.visual if hasattr(reference_model, "visual") else reference_model.model.visual
     if use_tt_vision:
         # Create the TorchVisionTransformer wrapper using the original vision model as reference
         vision_model_args = VisionModelArgs(
@@ -384,9 +386,9 @@ def test_demo(
             optimizations=DecodersPrecision.accuracy(config.vision_config.depth, ref_model_name),
         )
         vision_model_args.hf_config.vision_config.depth = config.vision_config.depth
-        visual_model = DropInVisionTransformer(reference_model.visual, vision_model_args, debug=False)  # show PCC
+        visual_model = DropInVisionTransformer(reference_visual, vision_model_args, debug=False)  # show PCC
     else:
-        visual_model = reference_model.visual
+        visual_model = reference_visual
     processor = AutoProcessor.from_pretrained(ref_model_name)
     num_tokens_generated_decode = []
     num_image_tokens = []

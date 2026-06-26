@@ -160,7 +160,11 @@ class Qwen3VLForConditionalGeneration(QwenVLGenerator, SupportsMultiModal):
             optimizations=DecodersPrecision.performance(config.vision_config.depth, ref_model_name),
         )
         vision_model_args.hf_config.vision_config.depth = config.vision_config.depth
-        visual_model = DropInVisionTransformer(reference_model.visual, vision_model_args)
+        # transformers 5.x dropped the `visual` backward-compat property; it now lives under `.model`.
+        reference_visual = (
+            reference_model.visual if hasattr(reference_model, "visual") else reference_model.model.visual
+        )
+        visual_model = DropInVisionTransformer(reference_visual, vision_model_args)
 
         return cls(
             model,
