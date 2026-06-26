@@ -621,3 +621,48 @@ def test_quant_uint8_per_tensor_2d(device, x0, x1, input_dtype, q_max):
     else:
         # bf16 input loses mantissa precision, so allow round-half-to-even off-by-one vs torch's fp32.
         assert close_ratio > 0.99, f"close_ratio={close_ratio} max_abs_err={max_abs_err}"
+
+
+# uint8 input to dequantize: the unpacker widens the uint8 tile to int32 in DST, so this only needs
+# the host-side dtype allowance (no LLK change). Output is float, compared against torch.dequantize.
+@pytest.mark.parametrize("x0", [32, 128])
+@pytest.mark.parametrize("x1", [32, 128])
+@pytest.mark.parametrize("output_dtype", [ttnn.float32, ttnn.bfloat16])
+def test_dequant_uint8_input_per_tensor_2d(device, x0, x1, output_dtype):
+    torch.manual_seed(0)
+    input_tr = torch.rand(x0, x1, dtype=torch.float32)
+    scale, zero_point = calculate_scale_zero_point_per_tensor(input_tr, 0, 255)
+
+    quantized_tr = torch.quantize_per_tensor(input_tr, scale, zero_point, dtype=torch.quint8)
+    dequantized_tr = torch.dequantize(quantized_tr)
+
+    q_uint8_tt = ttnn.from_torch(quantized_tr.int_repr(), dtype=ttnn.uint8, layout=ttnn.TILE_LAYOUT, device=device)
+    dequantized_tt = ttnn.dequantize(q_uint8_tt, scale, zero_point, dtype=output_dtype)
+    result_tr = ttnn.to_torch(dequantized_tt)
+
+    check_pcc(dequantized_tr, result_tr, False)
+    check_match_ratio(dequantized_tr, result_tr, output_dtype)
+
+
+# uint8 end-to-end: quantize -> uint8, requantize uint8 -> uint8 (exercises uint8 input AND output of
+# requant, including the fp32->uint8 rounding fix), then dequantize from uint8 back to float.
+@pytest.mark.parametrize("x0", [32, 128])
+@pytest.mark.parametrize("x1", [32, 128])
+@pytest.mark.parametrize("input_dtype", [ttnn.float32, ttnn.bfloat16])
+def test_quant_requant_dequant_uint8_per_tensor_2d(device, x0, x1, input_dtype):
+    torch.manual_seed(0)
+    input_tr = torch.rand(x0, x1, dtype=torch.float32)
+    scale, zero_point = calculate_scale_zero_point_per_tensor(input_tr, 0, 255)
+    # Requantize into a different (still uint8) affine grid.
+    scale_r, zero_point_r = calculate_scale_zero_point_per_tensor(input_tr, 0, 200)
+
+    input_tt = ttnn.from_torch(input_tr, dtype=input_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+    quantized_tt = ttnn.quantize(input_tt, scale, zero_point, dtype=ttnn.uint8)
+    assert quantized_tt.dtype == ttnn.uint8
+    requantized_tt = ttnn.requantize(quantized_tt, scale, zero_point, scale_r, zero_point_r, dtype=ttnn.uint8)
+    assert requantized_tt.dtype == ttnn.uint8
+    derequantized_tt = ttnn.dequantize(requantized_tt, scale_r, zero_point_r, dtype=input_dtype)
+
+    result_tr = ttnn.to_torch(derequantized_tt)
+    check_pcc(input_tr, result_tr, True)
+    check_match_ratio(input_tr, result_tr, input_dtype)

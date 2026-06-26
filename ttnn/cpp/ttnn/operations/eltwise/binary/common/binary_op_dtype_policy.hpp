@@ -25,6 +25,10 @@ inline constexpr std::array maximum_minimum{
 
 inline constexpr std::array int32_only{DT::INT32};
 
+// REQUANT/DEQUANT input: an int32 quantized tile, or a uint8 quantized tile that the unpacker
+// widens to int32 in DST before the dequant/requant SFPU casts it to fp32.
+inline constexpr std::array requant_dequant_in{DT::INT32, DT::UINT8};
+
 inline constexpr std::array bitwise_shift{DT::UINT32, DT::UINT16, DT::INT32};
 
 inline constexpr std::array logical_right_shift{DT::UINT32, DT::INT32};

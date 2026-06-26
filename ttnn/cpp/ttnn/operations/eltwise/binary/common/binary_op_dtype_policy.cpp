@@ -45,7 +45,7 @@ std::span<const DataType> supported_tensor_a_dtypes(BinaryOpType op) {
         case BinaryOpType::DIV_FLOOR:
         case BinaryOpType::DIV_TRUNC:
         case BinaryOpType::REQUANT:
-        case BinaryOpType::DEQUANT: return int32_only;
+        case BinaryOpType::DEQUANT: return requant_dequant_in;
         case BinaryOpType::LOGADDEXP:
         case BinaryOpType::LOGADDEXP2:
         case BinaryOpType::LDEXP:

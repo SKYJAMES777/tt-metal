@@ -325,12 +325,23 @@ Tensor requantize(
     const std::optional<MemoryConfig>& memory_config,
     std::optional<Tensor> optional_output_tensor) {
     const DataType a_dtype = input_tensor.dtype();
-    constexpr DataType c_dtype = DataType::INT32;
+    // uint8 in/out mirrors quantize: the unpacker widens a uint8 input to int32 in DST and the packer
+    // narrows the int32 result back to uint8. For uint8 output the requant SFPU init additionally
+    // rounds into the unsigned [0, 255] range instead of the signed int8 [-128, 127] range.
+    const DataType c_dtype = get_output_dtype(output_dtype, optional_output_tensor, DataType::INT32);
 
-    TT_FATAL(a_dtype == DataType::INT32, "Requantize only supports int32 inputs for now");
-    TT_FATAL(output_dtype.value_or(c_dtype) == c_dtype, "Requantize only supports int32 outputs for now");
+    TT_FATAL(
+        a_dtype == DataType::INT32 || a_dtype == DataType::UINT8,
+        "Requantize only supports int32 or uint8 inputs for now, got {}",
+        a_dtype);
+    TT_FATAL(
+        c_dtype == DataType::INT32 || c_dtype == DataType::UINT8,
+        "Requantize only supports int32 or uint8 outputs for now, got {}",
+        c_dtype);
     if (optional_output_tensor.has_value()) {
-        TT_FATAL(optional_output_tensor->dtype() == c_dtype, "Requantize only supports int32 outputs for now");
+        TT_FATAL(
+            optional_output_tensor->dtype() == c_dtype,
+            "Requantize output tensor dtype must match the requested output dtype");
     }
 
     constexpr ttsl::Span<const operations::unary::EltwiseUnaryWithParam> none{};
@@ -469,7 +480,13 @@ Tensor dequantize(
     const DataType a_dtype = input_tensor.dtype();
     const DataType c_dtype = get_output_dtype(output_dtype, optional_output_tensor, DataType::BFLOAT16);
 
-    TT_FATAL(a_dtype == DataType::INT32, "Dequantize only supports int32 inputs for now");
+    // uint8 input is read the same way as int32: the unpacker widens the uint8 tile to int32 in DST,
+    // and the dequant SFPU casts that to fp32 before applying (q - zero_point) * scale. No LLK change
+    // is needed because dequant output is floating-point (no narrowing/rounding on the result).
+    TT_FATAL(
+        a_dtype == DataType::INT32 || a_dtype == DataType::UINT8,
+        "Dequantize only supports int32 or uint8 inputs for now, got {}",
+        a_dtype);
     TT_FATAL(
         c_dtype == DataType::FLOAT32 || c_dtype == DataType::BFLOAT16,
         "Dequantize only supports bf16/f32 outputs for now");

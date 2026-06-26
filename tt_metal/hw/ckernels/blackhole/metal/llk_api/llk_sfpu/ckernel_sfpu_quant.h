@@ -136,7 +136,7 @@ void quant_init(const uint zero_point) {
     }
 }
 
-template <bool APPROXIMATION_MODE /*unused*/, bool SIGN_MAGNITUDE_FORMAT = false>
+template <bool APPROXIMATION_MODE /*unused*/, bool SIGN_MAGNITUDE_FORMAT = false, bool IS_UNSIGNED = false>
 void requant_init(const uint zero_point) {
     // One-time setup for requant_int32; see quant_init for the
     // record/replay rationale. Loads the zero point into LREG2, programs
@@ -166,14 +166,30 @@ void requant_init(const uint zero_point) {
         // stalls STOCH_RND below until SFPMAD's LREG0 write retires, so no
         // explicit pipeline-bubble TTI_SFPNOP is needed here.
         TTI_SFPMAD(p_sfpu::LREG0, p_sfpu::LREG1, p_sfpu::LREG2, p_sfpu::LREG0, 0 /*mod1*/);
-        // fp32 -> int sign-magnitude. LCONST_0 (LREG9) provides the 0.0 descale.
-        TTI_SFP_STOCH_RND(
-            sfpi::SFPSTOCHRND_RND_EVEN,
-            0 /*imm8*/,
-            p_sfpu::LCONST_0,
-            p_sfpu::LREG0,
-            p_sfpu::LREG0,
-            sfpi::SFPSTOCHRND_MOD1_FP32_TO_INT8);
+        // fp32 -> int. LCONST_0 (LREG9) provides the 0.0 descale. For unsigned
+        // (uint8) output, round into the full [0, 255] range; otherwise clamp to
+        // signed int8 [-128, 127]. The recorded body length is identical either
+        // way, so REPLAY_LEN accounting is unaffected.
+        if constexpr (IS_UNSIGNED) {
+            TTI_SFP_STOCH_RND(
+                sfpi::SFPSTOCHRND_RND_EVEN,
+                0 /*imm8*/,
+                p_sfpu::LCONST_0,
+                p_sfpu::LREG0,
+                p_sfpu::LREG0,
+                sfpi::SFPSTOCHRND_MOD1_FP32_TO_UINT8);
+        } else {
+            TTI_SFP_STOCH_RND(
+                sfpi::SFPSTOCHRND_RND_EVEN,
+                0 /*imm8*/,
+                p_sfpu::LCONST_0,
+                p_sfpu::LREG0,
+                p_sfpu::LREG0,
+                sfpi::SFPSTOCHRND_MOD1_FP32_TO_INT8);
+        }
+        // Unsigned uint8 values are non-negative, so the sign-magnitude <-> 2's
+        // complement fix-up below is a no-op for them; it only matters for the
+        // signed int8 path.
         if constexpr (!SIGN_MAGNITUDE_FORMAT) {
             // STOCH_RND output is sign-magnitude; convert to 2's-complement
             // for the trailing INT32_2S_COMP SFPSTORE. Same cast+SETSGN

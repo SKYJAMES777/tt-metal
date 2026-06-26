@@ -114,6 +114,17 @@ ALWI void requant_tile_init(const uint32_t zero_point) {
 
 // clang-format off
 /**
+ * Same as requant_tile_init, but configures the requant SFPU to round into the unsigned uint8
+ * range [0, 255] instead of the signed int8 range [-128, 127]. Pair with requant_tile when the
+ * requantize op output dtype is uint8 (the packer narrows the int32 result to uint8).
+ */
+// clang-format on
+ALWI void requant_uint8_tile_init(const uint32_t zero_point) {
+    MATH((SFPU_BINARY_INIT_FN_ARGS(requant_int32, sfpu::requant_init, (APPROX, false, true), zero_point)));
+}
+
+// clang-format off
+/**
  * Initialize the sfpu with the zero point argument of the de-quantization Op.
  * To be called once at beginning of a kernel.
  *
