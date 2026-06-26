@@ -118,9 +118,23 @@ EXACT RESUME SPECIFICS for the kernel sync wiring (verified by inspection):
 - Test: rotation scenarios; metadata path passes kv_actual_isl=None (host can't compute q-mapping →
   kernels must → discriminating).
 
-**BLOCKER (current, task 4 active path):** the compute kernel reading the reader-produced CB fails to
+**RESOLVED + WORKING (task 4 core).** The full `kv_actual_isl`/`logical_n` metadata path is bit-exact vs
+the scalar path: `test_ring_mla_metadata_matches_scalar_rotation[kv64/kv256/kv320]` pass on 8×4 (the
+metadata path drops `kv_actual_isl`, so the q-mapping is derived SOLELY on-device). The compute kernel
+reads the reader-produced scalars from `cb_kv_pad_derived` via **`ckernel::read_tile_value(cb, tile,
+elem)`** (`api/compute/cb_api.h`) — the TRISC-safe UNPACK-mailbox CB read, mirroring `sparse_sdpa`'s
+`cb_ctrl` (thanks to that op for the pattern). `read_tile_value` touches `cb_interface` only inside
+`UNPACK({})` (trisc0) and mailboxes the value to MATH/PACK, so it links on all threads — the earlier
+`CircularBuffer::get_read_ptr()` referenced `cb_interface` on MATH/PACK (trisc1), which does not link.
+`element_offset` is a uint32 index (4 B), independent of CB format. REMAINING (trace-replay only, NOT
+needed for the non-trace bit-exact test, since the host supplies correct logical_nt/masks/gather bound
+from the passed `logical_n`): (1) WRITER recompute logical_nt + masks from metadata[1] (lines 453-455);
+(2) all-gather reader recompute `gather_valid_Ht` from metadata. Until those land, an actual captured
+trace would freeze the writer's masks + the gather extent.
+
+(Historical blocker, now resolved:) the compute kernel reading the reader-produced CB initially failed to
 LINK on TRISC: `undefined reference to cb_interface` (from `CircularBuffer::get_read_ptr()` /
-`get_local_cb_interface`). It's gated by `if constexpr (kv_pad_from_metadata)`, so it's discarded on the
+`get_local_cb_interface` on trisc1/MATH). Fixed by `read_tile_value` as above. It's gated by `if constexpr (kv_pad_from_metadata)`, so it's discarded on the
 scalar/indexed path (committed tests stay green) and only fails when the rotation metadata path is
 active (the uncommitted `test_ring_mla_metadata_matches_scalar_rotation`). `cb_interface` is
 `extern`/firmware-provided; the ring_joint compute kernel's `--just-symbols` weakened elf doesn't supply
