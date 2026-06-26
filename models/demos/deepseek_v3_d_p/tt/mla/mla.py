@@ -232,6 +232,7 @@ class ttMLA:
         slot_num: int = 1,
         layer_num: int = 61,
         kv_only: bool = False,
+        use_metadata_tensor: bool = False,
     ):
         self.config = config
         self.mesh_device = mesh_device
@@ -242,6 +243,10 @@ class ttMLA:
         self.is_chunked = is_chunked
         self.slot_num = slot_num
         self.layer_num = layer_num
+        # Trace-safe metadata path: when set, the chunked-prefill ring_mla reads its per-chunk scalars
+        # (kv_cache_batch_idx, kv_actual_isl) on-device from a [slot_id, actual_start, actual_end] uint32
+        # metadata tensor instead of host scalars, mirroring the runner's h2d_socket_sync payload.
+        self.use_metadata_tensor = use_metadata_tensor
 
         # The RoPE op is fixed by the configured mode: chunked prefill uses the indexed op,
         # single-shot uses rotary_embedding_llama. Bind once here so forward doesn't re-decide.
@@ -624,6 +629,31 @@ class ttMLA:
         # K and V are the single latent kvpe cache (V = first kv_lora_rank columns, materialized
         # in-op). logical_n = prior valid length + this chunk; cache_batch_idx selects this
         # user/layer's slot; kv_actual_isl drives the on-device rotation/causality offset.
+        #
+        # Trace-safe metadata path: when enabled, pass a [slot_id, actual_start, actual_end] uint32 DRAM
+        # tensor instead of the kv_cache_batch_idx / kv_actual_isl host scalars -- ring_mla reads them
+        # on-device (the all-gather + SDPA readers read slot_id from metadata[0], and the SDPA reader
+        # derives logical_nt / q-mapping / ring masks from kv_actual_isl = metadata[1]). logical_n is
+        # still passed (host shape arg); the kernels override the derived values from metadata.
+        kv_pad_metadata = None
+        meta_slot_kwargs = {"kv_cache_batch_idx": cache_batch_idx, "kv_actual_isl": kv_actual_isl}
+        if self.use_metadata_tensor:
+            meta_actual_end = actual_end if actual_end is not None else (kv_actual_isl + chunk_size_global)
+            # metadata[0] is the flat cache slot ring_mla gathers (cache_batch_idx = cache_user_id *
+            # layer_num + layer_idx), i.e. exactly the kv_cache_batch_idx the scalar path passes -- NOT the
+            # raw cache_user_id (they coincide only when layer_num == 1).
+            meta_payload = torch.tensor(
+                [cache_batch_idx, kv_actual_isl, meta_actual_end, 0], dtype=torch.int64
+            ).reshape(1, 1, 1, 4)
+            kv_pad_metadata = ttnn.from_torch(
+                meta_payload,
+                device=self.mesh_device,
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+            meta_slot_kwargs = {"kv_cache_batch_idx": None, "kv_actual_isl": None, "metadata": kv_pad_metadata}
         attn_out, _ = ttnn.transformer.ring_mla(
             tt_q,
             kvpe_cache,
@@ -642,9 +672,10 @@ class ttMLA:
             ccl_core_grid_offset=self.tt_ccl.ring_attention_ccl_core_grid_offset,
             use_column_major_ccl=True,
             is_balanced=self.is_balanced,
-            kv_cache_batch_idx=cache_batch_idx,
-            kv_actual_isl=kv_actual_isl,
+            **meta_slot_kwargs,
         )
+        if kv_pad_metadata is not None:
+            ttnn.deallocate(kv_pad_metadata)
 
         # ring_mla output is in kv_lora_rank (latent V) space; expand to v_head_dim per head. Unlike the
         # single-shot path this in0 is the per-head SDPA output (batch=local_heads), so the tuned 640

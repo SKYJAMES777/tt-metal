@@ -519,6 +519,7 @@ def _run_chunked_prefill(
     num_users=1,
     use_pretrained=False,
     topology=ttnn.Topology.Linear,
+    use_metadata_tensor=False,
 ):
     """Unified chunked-prefill scenario, decoupled from the reference.
 
@@ -634,6 +635,7 @@ def _run_chunked_prefill(
         is_chunked=True,
         slot_num=num_users,
         layer_num=1,
+        use_metadata_tensor=use_metadata_tensor,
     )
     rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False)
     indexed_rope = rope_setup.get_rope_tensors_indexed(
@@ -843,8 +845,9 @@ _CHUNKED_SCENARIOS = (
 @pytest.mark.parametrize("reference", ["cpu", "trace", None], ids=["cpu", "trace", "func"])
 @pytest.mark.parametrize("kwargs", [kw for _, kw in _CHUNKED_SCENARIOS], ids=[sid for sid, _ in _CHUNKED_SCENARIOS])
 @pytest.mark.parametrize("variant", ["deepseek_v3_d_p", "kimi_k2_6"], indirect=True, ids=["dsv3", "kimi"])
+@pytest.mark.parametrize("use_metadata_tensor", [False, True], ids=["scalar", "metadata"])
 @pytest.mark.timeout(0)
-def test_mla_chunked_prefill(request, mesh_device, kwargs, reference, device_params, variant):
+def test_mla_chunked_prefill(request, mesh_device, kwargs, reference, device_params, variant, use_metadata_tensor):
     """Unified chunked-prefill driver crossed with independent mesh and reference axes. Each
     functionality scenario (rotation edges, production depth, multi-user, deep prefix) runs on any mesh
     and is validated against the CPU torch reference ('cpu'), the GPU trace ('trace', skips without
@@ -871,4 +874,6 @@ def test_mla_chunked_prefill(request, mesh_device, kwargs, reference, device_par
         if device_params.get("fabric_config") == ttnn.FabricConfig.FABRIC_1D_RING
         else ttnn.Topology.Linear
     )
-    _run_chunked_prefill(request, mesh_device, reference=reference, topology=topology, **kwargs)
+    _run_chunked_prefill(
+        request, mesh_device, reference=reference, topology=topology, use_metadata_tensor=use_metadata_tensor, **kwargs
+    )
