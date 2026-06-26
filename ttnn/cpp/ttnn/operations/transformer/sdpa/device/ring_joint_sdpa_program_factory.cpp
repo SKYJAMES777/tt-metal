@@ -1322,11 +1322,19 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         compile_time_active_ring_iter_mask,
         compile_time_last_active_ring_iter,
         compile_time_single_valid_kv_chunk_mask,
+        // Slot 34: trace-safe KV-pad derivation -- the writer recomputes logical_nt + masks from
+        // metadata[1] on-device (it's dataflow). New writer fixed slot -> output accessors shift to 35.
+        static_cast<uint32_t>(kv_pad_from_metadata),
     };
 
     TensorAccessorArgs(output_tensor.buffer()).append_to(writer_compile_time_args);
     TensorAccessorArgs(joint_output_tensor.buffer()).append_to(writer_compile_time_args);
     TensorAccessorArgs(stats_output_tensor.buffer()).append_to(writer_compile_time_args);
+    // Metadata accessor follows the output accessors (metadata path only); matches the writer kernel's
+    // meta_args_offset, which is gated on kv_pad_from_metadata.
+    if (kv_pad_from_metadata) {
+        TensorAccessorArgs(tensor_args.metadata->buffer()).append_to(writer_compile_time_args);
+    }
 
     std::vector<uint32_t> compute_compile_time_args = {
         B,
@@ -2292,6 +2300,11 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     writer_kernel.compile_time_args = writer_compile_time_args;
     writer_kernel.defines = kernel_defines;
     writer_kernel.config = WriterConfigDescriptor{};
+    // Trace-safe KV-pad derivation: the metadata tensor's raw DRAM address is common runtime arg 0; the
+    // writer reads kv_actual_isl = metadata[1] from it on-device (mirrors the reader).
+    if (kv_pad_from_metadata) {
+        writer_kernel.emplace_common_runtime_args({tensor_args.metadata->buffer()->address()});
+    }
 
     KernelDescriptor compute_kernel{};
     compute_kernel.kernel_source =
