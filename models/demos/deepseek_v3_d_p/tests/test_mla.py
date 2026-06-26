@@ -735,12 +735,16 @@ def _run_chunked_prefill(
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
                 )
+            # Metadata path: pass ONLY the metadata tensor (the runner hands tt_metadata straight from
+            # inbound_socket_service_sync) -- actual_start/actual_end are read on-device, so leave them
+            # None to prove forward needs no host per-chunk scalars. cache_user_id is unused on this path
+            # (slot comes from metadata[0]).
             tt_out = mla_tt.forward(
                 hidden_states=tt_h,
                 rope_tensors=indexed_rope,
                 kvpe_cache=tt_kvpe_cache,
-                actual_start=kv_actual,
-                actual_end=valid_end,
+                actual_start=None if use_metadata_tensor else kv_actual,
+                actual_end=None if use_metadata_tensor else valid_end,
                 cache_user_id=u,
                 metadata=kv_pad_metadata,
             )

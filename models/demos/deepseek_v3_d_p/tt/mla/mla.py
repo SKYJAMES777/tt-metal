@@ -605,7 +605,10 @@ class ttMLA:
             f"chunk_size_global ({chunk_size_global}) must be a multiple of "
             f"TILE_SIZE * sp_factor ({tile_size * self.sp_factor})"
         )
-        assert kv_actual_isl % tile_size == 0, f"kv_actual_isl ({kv_actual_isl}) must be tile-aligned"
+        # Metadata path: kv_actual_isl is read on-device from metadata[1] and may be omitted host-side.
+        assert (
+            metadata is not None or kv_actual_isl % tile_size == 0
+        ), f"kv_actual_isl ({kv_actual_isl}) must be tile-aligned"
 
         # Write this chunk into the cache. update_padded_kv_cache derives each chip's local write
         # offset on-device from kv_actual_global (chunk-aligned kv_actual -> uniform per-chip write).
@@ -670,18 +673,22 @@ class ttMLA:
         # [slot_id, actual_start, actual_end] h2d_socket_sync payload, passed in from outside -- NOT
         # reconstructed here), ring_mla reads its per-chunk scalars on-device: the all-gather + SDPA
         # readers take the cache slot from metadata[0], and the SDPA reader derives logical_nt / q-mapping
-        # / ring masks from kv_actual_isl = metadata[1]. logical_n is still passed as the host shape arg;
-        # the kernels override the derived values from metadata. Otherwise pass the host scalars.
+        # / ring masks (and the all-gather extent gather_valid_Ht) from kv_actual_isl = metadata[1]. Since
+        # every kernel derives logical_n on-device on this path, the host logical_n is unused -- pass a
+        # placeholder = global cache capacity (a safe upper bound) so no host actual_start is needed and
+        # the runner can hand in just the metadata tensor. Otherwise pass the host scalars + true logical_n.
         if metadata is not None:
             meta_slot_kwargs = {"metadata": metadata}
+            ring_logical_n = kvpe_cache.shape[2] * self.sp_factor  # global cache capacity
         else:
             meta_slot_kwargs = {"kv_cache_batch_idx": cache_batch_idx, "kv_actual_isl": kv_actual_isl}
+            ring_logical_n = kv_actual_isl + chunk_size_global
         attn_out, _ = ttnn.transformer.ring_mla(
             tt_q,
             kvpe_cache,
             persistent_output_buffer_kv=self._chunked_kv_buf,
             head_dim_v=self.kv_lora_rank,
-            logical_n=kv_actual_isl + chunk_size_global,
+            logical_n=ring_logical_n,
             program_config=self._get_sdpa_program_config(seq_len_local),
             scale=self.scale,
             compute_kernel_config=self.default_compute_kernel_config,
@@ -756,7 +763,9 @@ class ttMLA:
         # rope prologue and the nlp_concat_heads + o_proj epilogue; they differ only in cache write,
         # attention op, and where wkv_b2 is applied. See _chunked_attn for the unified chunked impl.
         kv_actual_isl = actual_start
-        assert (actual_start is not None) == self.is_chunked, (
+        # Chunked requires actual_start, EXCEPT on the metadata path where the per-chunk scalars are read
+        # on-device from the metadata tensor (the runner passes only that tensor, no host actual_start).
+        assert metadata is not None or (actual_start is not None) == self.is_chunked, (
             f"actual_start ({'set' if actual_start is not None else 'None'}) does not match construction "
             f"(self.is_chunked={self.is_chunked}); pass actual_start/actual_end iff built with is_chunked=True"
         )
