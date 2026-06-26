@@ -635,7 +635,6 @@ def _run_chunked_prefill(
         is_chunked=True,
         slot_num=num_users,
         layer_num=1,
-        use_metadata_tensor=use_metadata_tensor,
     )
     rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False)
     indexed_rope = rope_setup.get_rope_tensors_indexed(
@@ -721,6 +720,21 @@ def _run_chunked_prefill(
                     mesh_device, mesh_shape=tuple(mesh_device.shape), dims=hidden_shard_dims
                 ),
             )
+            # Trace-safe metadata variant: build the runner's canonical [slot_id, actual_start, actual_end]
+            # uint32 DRAM tensor here (the "outside") and hand it to forward verbatim -- ttMLA threads it
+            # to all chunked ops (update/rope/zero_pad/ring_mla), which read their per-chunk scalars
+            # on-device. slot_id = cache_user_id (layer_num=1, so it is also the flat cache slot).
+            kv_pad_metadata = None
+            if use_metadata_tensor:
+                meta_payload = torch.tensor([u, kv_actual, valid_end, 0], dtype=torch.int64).reshape(1, 1, 1, 4)
+                kv_pad_metadata = ttnn.from_torch(
+                    meta_payload,
+                    device=mesh_device,
+                    dtype=ttnn.uint32,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                )
             tt_out = mla_tt.forward(
                 hidden_states=tt_h,
                 rope_tensors=indexed_rope,
@@ -728,7 +742,10 @@ def _run_chunked_prefill(
                 actual_start=kv_actual,
                 actual_end=valid_end,
                 cache_user_id=u,
+                metadata=kv_pad_metadata,
             )
+            if kv_pad_metadata is not None:
+                ttnn.deallocate(kv_pad_metadata)
             out_flat = ttnn.to_torch(
                 tt_out,
                 mesh_composer=ttnn.ConcatMesh2dToTensor(
