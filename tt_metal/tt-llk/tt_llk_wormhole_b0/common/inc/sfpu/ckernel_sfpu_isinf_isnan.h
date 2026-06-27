@@ -88,10 +88,8 @@ template <bool APPROXIMATION_MODE>
 inline sfpi::vFloat _calculate_isnan_(const sfpi::vFloat& in)
 {
     // SFPU microcode
-    sfpi::vInt exp   = sfpi::exexp(in);
-    sfpi::vInt man   = sfpi::exman(in);
     sfpi::vFloat out = sfpi::vConst0;
-    v_if (exp == 128 && man != 0)
+    v_if (sfpi::is_nan(in))
     {
         out = sfpi::vConst1;
     }
@@ -104,11 +102,10 @@ inline sfpi::vFloat _calculate_isfinite_(const sfpi::vFloat& v)
 {
     // SFPU microcode
     // A number is finite if it's neither infinity nor NaN
-    sfpi::vInt exp      = sfpi::exexp(v);
     sfpi::vFloat result = sfpi::vConst1; // Assume finite (1.0f) by default
 
     // If exponent is 128, the number is either infinity or NaN (not finite)
-    v_if (exp == 128)
+    v_if (!sfpi::is_finite(in))
     {
         result = sfpi::vConst0;
     }
