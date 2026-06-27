@@ -5,12 +5,10 @@
 #include "fused_hyperconnection.hpp"
 
 #include "device/fused_pre_post_device_operation.hpp"
+#include "device/sinkhorn_device_operation.hpp"
 
 #include "ttnn/operations/core/core.hpp"
-#include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
-#include "ttnn/operations/normalization/softmax/softmax.hpp"
-#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
 
 namespace ttnn::experimental::deepseek::hyperconnection {
 
@@ -34,7 +32,6 @@ std::tuple<Tensor, Tensor, Tensor> fused_hyperconnection(
     const uint32_t s = static_cast<uint32_t>(shape[1]);
     const uint32_t hc = num_streams;
     const uint32_t d = static_cast<uint32_t>(shape[-1]);
-    const uint32_t t = b * s;
 
     // Decode-only fused stage (T == 1):
     //   post      = 2 * sigmoid(post_w * post_scale + post_bias)            [1,1,1,H]
@@ -43,16 +40,14 @@ std::tuple<Tensor, Tensor, Tensor> fused_hyperconnection(
     auto [post, collapsed] = ttnn::prim::fused_hyperconnection_pre_post(
         pre_w, post_w, pre_bias, post_bias, hidden_streams, pre_scale, post_scale, eps, memory_config);
 
-    // comb logits -> [1,T,H,H]; softmax over last dim, then Sinkhorn (alternate row/col
-    // normalisation) onto the doubly-stochastic manifold.
-    Tensor comb_logits = ttnn::add(ttnn::multiply(comb_w, comb_scale), comb_bias);  // [1,1,T,H*H]
-    comb_logits = ttnn::reshape(comb_logits, ttnn::Shape({1, t, hc, hc}));
-    Tensor comb = ttnn::add(ttnn::softmax(comb_logits, -1), eps);
-    comb = ttnn::divide(comb, ttnn::add(ttnn::sum(comb, /*dim=*/-2, /*keepdim=*/true), eps));  // column
-    for (uint32_t i = 1; i < sinkhorn_iters; ++i) {
-        comb = ttnn::divide(comb, ttnn::add(ttnn::sum(comb, /*dim=*/-1, /*keepdim=*/true), eps));  // row
-        comb = ttnn::divide(comb, ttnn::add(ttnn::sum(comb, /*dim=*/-2, /*keepdim=*/true), eps));  // column
-    }
+    // comb: softmax(comb_w * comb_scale + comb_bias, dim=-1) + eps, then Sinkhorn (alternate
+    // row/col normalisation) onto the doubly-stochastic manifold, fused into a single device op.
+    // The [1,1,1,H*H] projection/bias rows are reshaped to the [1,1,H,H] comb matrix; the device
+    // op masks the valid HxH block inside the 32x32 tile.
+    Tensor comb_w_mat = ttnn::reshape(comb_w, ttnn::Shape({1, 1, hc, hc}));
+    Tensor comb_bias_mat = ttnn::reshape(comb_bias, ttnn::Shape({1, 1, hc, hc}));
+    Tensor comb = ttnn::prim::fused_hyperconnection_sinkhorn(
+        comb_w_mat, comb_bias_mat, hc, sinkhorn_iters, comb_scale, eps, memory_config);
 
     post = ttnn::reshape(post, ttnn::Shape({b, s, hc, 1}));
     comb = ttnn::reshape(comb, ttnn::Shape({b, s, hc, hc}));
