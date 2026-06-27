@@ -52,17 +52,16 @@ binary_fns = {
     "ttnn_fn",
     binary_fns,
 )
-def test_binary_scalar_ops_invalid_bcast(a_shape, b_shape, ttnn_fn, device):
+def test_binary_scalar_ops_invalid_bcast(a_shape, b_shape, ttnn_fn, device, expect_error):
     torch.manual_seed(0)
     ttnn_op = getattr(ttnn, ttnn_fn)
 
     _, a_tt = rand_bf16_gen(a_shape, device)
     _, b_tt = rand_bf16_gen(b_shape, device)
 
-    with pytest.raises(RuntimeError) as e:
+    with expect_error(RuntimeError, r"Broadcasting rule violation|Invalid subtile broadcast type"):
         cq_id = 0
         _ = ttnn_op(a_tt, b_tt, queue_id=cq_id)
-        assert "Broadcasting rule violation" in str(e.value)
 
 
 @pytest.mark.parametrize(
@@ -77,7 +76,7 @@ def test_binary_scalar_ops_invalid_bcast(a_shape, b_shape, ttnn_fn, device):
     "ttnn_fn",
     binary_fns,
 )
-def test_binary_opt_output_invalid_bcast(a_shape, b_shape, out_shape, ttnn_fn, device):
+def test_binary_opt_output_invalid_bcast(a_shape, b_shape, out_shape, ttnn_fn, device, expect_error):
     torch.manual_seed(0)
     ttnn_op = getattr(ttnn, ttnn_fn)
 
@@ -85,8 +84,9 @@ def test_binary_opt_output_invalid_bcast(a_shape, b_shape, out_shape, ttnn_fn, d
     _, input_tensor_b = rand_bf16_gen(b_shape, device)
     _, out_tt = rand_bf16_gen(out_shape, device)
 
-    with pytest.raises(
-        RuntimeError, match=r"Shape of Output tensor.+ provided does not match the broadcasted output shape .+"
+    with expect_error(
+        RuntimeError,
+        r"Shape of Output tensor.+ provided does not match the broadcasted output shape .+",
     ):
         cq_id = 0
         ttnn_op(input_tensor_a, input_tensor_b, queue_id=cq_id, output_tensor=out_tt)
@@ -159,6 +159,26 @@ def rand_bf16_gen(shape, device, *, min=0, max=1, memory_config=ttnn.DRAM_MEMORY
     pt = torch.rand(shape, dtype=torch.bfloat16) * (max - min) + min
     tt = ttnn.from_torch(pt, device=device, layout=ttnn.TILE_LAYOUT, memory_config=memory_config)
     return pt, tt
+
+
+def assert_inplace_binary_matches(torch_output_tensor, output_tensor, *, pcc_threshold=0.99):
+    if torch_output_tensor.numel() == 0:
+        return
+
+    golden_uniform = torch.max(torch_output_tensor) == torch.min(torch_output_tensor)
+    device_uniform = torch.max(output_tensor) == torch.min(output_tensor)
+
+    if golden_uniform and device_uniform:
+        if not torch.isfinite(torch_output_tensor.flatten()[0]) or not torch.isfinite(output_tensor.flatten()[0]):
+            assert torch.equal(torch_output_tensor, output_tensor), (
+                f"Non-finite uniform tensors differ: golden={torch_output_tensor.flatten()[0]}, "
+                f"device={output_tensor.flatten()[0]}"
+            )
+            return
+        assert_with_ulp(torch_output_tensor, output_tensor, ulp_threshold=4)
+        return
+
+    assert ttnn.pearson_correlation_coefficient(torch_output_tensor, output_tensor) >= pcc_threshold
 
 
 @pytest.mark.parametrize(
@@ -656,23 +676,16 @@ def test_inplace_binary_ops_with_tensor(a_shape, b_shape, ttnn_fn, activations, 
     output_tensor = ttnn.to_torch(input_tensor_a)
     assert output_tensor.shape == torch_output_tensor.shape
 
-    def compare(output_tensor, torch_output_tensor):
-        imprecise_cases = {
-            *parameters(
-                {"logaddexp2_"},
-                {exp_floor_lhs_exp_rhs, no_activations, sin_rhs, log_lhs_sqrt_abs_post, square_lhs},
-            ),
-            *parameters({"bias_gelu_"}, {no_activations, sin_rhs, square_lhs}),
-            *parameters({"gt_", "le_", "ge_", "lt_"}, {sin_rhs, square_lhs}),
-        }
-
-        return (
-            ttnn.pearson_correlation_coefficient(torch_output_tensor, output_tensor) >= 0.98
-            if (ttnn_fn, activations) in imprecise_cases
-            else ttnn.pearson_correlation_coefficient(torch_output_tensor, output_tensor) >= 0.999
-        )
-
-    assert compare(output_tensor, torch_output_tensor)
+    imprecise_cases = {
+        *parameters(
+            {"logaddexp2_"},
+            {exp_floor_lhs_exp_rhs, no_activations, sin_rhs, log_lhs_sqrt_abs_post, square_lhs},
+        ),
+        *parameters({"bias_gelu_"}, {no_activations, sin_rhs, square_lhs}),
+        *parameters({"gt_", "le_", "ge_", "lt_"}, {sin_rhs, square_lhs}),
+    }
+    pcc_threshold = 0.98 if (ttnn_fn, activations) in imprecise_cases else 0.999
+    assert_inplace_binary_matches(torch_output_tensor, output_tensor, pcc_threshold=pcc_threshold)
 
 
 @pytest.mark.parametrize(
@@ -772,7 +785,7 @@ def test_inplace_binary_with_scalar(a_shape, scalar, ttnn_fn, device):
     ttnn_op(input_tensor_a, scalar)
     output_tensor = ttnn.to_torch(input_tensor_a)
     assert output_tensor.shape == torch_output_tensor.shape
-    assert ttnn.pearson_correlation_coefficient(torch_output_tensor, output_tensor) >= 0.99
+    assert_inplace_binary_matches(torch_output_tensor, output_tensor, pcc_threshold=0.99)
 
 
 profile_a_b_shape_pairs = [
