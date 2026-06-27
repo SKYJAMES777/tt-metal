@@ -62,8 +62,9 @@ def _torch_reference(
     return post, comb, collapsed
 
 
-@pytest.mark.parametrize("seq_len", (32, 128))
-@pytest.mark.parametrize("batch_size", (1, 2))
+# Decode-only fused op: a single token (T == B * S == 1).
+@pytest.mark.parametrize("seq_len", (1,))
+@pytest.mark.parametrize("batch_size", (1,))
 @pytest.mark.parametrize("sinkhorn_iters", (1, 20))
 def test_fused_hyperconnection_op(device, reset_seeds, batch_size, seq_len, sinkhorn_iters):
     hc = 4  # number of streams (hc_mult)

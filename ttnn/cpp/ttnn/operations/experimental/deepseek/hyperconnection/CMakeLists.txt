@@ -13,6 +13,8 @@ set_target_properties(
             api
 )
 
+file(GLOB_RECURSE kernels device/kernels/*)
+
 target_sources(
     ttnn_op_experimental_deepseek_hyperconnection
     PUBLIC
@@ -20,10 +22,24 @@ target_sources(
         TYPE HEADERS
         BASE_DIRS ${FixmeOpAPIDir}
         FILES ${TTNN_OP_EXPERIMENTAL_DEEPSEEK_HYPERCONNECTION_API_HEADERS}
+        FILE_SET kernels
+        TYPE HEADERS
+        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
+        FILES ${kernels}
     PRIVATE
         ${TTNN_OP_EXPERIMENTAL_DEEPSEEK_HYPERCONNECTION_SRCS}
 )
 
 target_link_libraries(ttnn_op_experimental_deepseek_hyperconnection PRIVATE TT::Metalium PUBLIC TTNN::Core)
+
+install(
+    TARGETS
+        ttnn_op_experimental_deepseek_hyperconnection
+    FILE_SET
+    kernels
+        DESTINATION
+            ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/ttnn/cpp/ttnn/operations/experimental/deepseek/hyperconnection
+        COMPONENT ttnn-runtime
+)
 
 install(TARGETS ttnn_op_experimental_deepseek_hyperconnection FILE_SET api COMPONENT ttnn-dev LIBRARY COMPONENT tar)

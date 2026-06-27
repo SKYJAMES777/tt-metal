@@ -3,4 +3,8 @@
 
 set(TTNN_OP_EXPERIMENTAL_DEEPSEEK_HYPERCONNECTION_API_HEADERS fused_hyperconnection.hpp)
 
-set(TTNN_OP_EXPERIMENTAL_DEEPSEEK_HYPERCONNECTION_SRCS fused_hyperconnection.cpp)
+set(TTNN_OP_EXPERIMENTAL_DEEPSEEK_HYPERCONNECTION_SRCS
+    fused_hyperconnection.cpp
+    device/fused_pre_post_device_operation.cpp
+    device/fused_pre_post_program_factory.cpp
+)

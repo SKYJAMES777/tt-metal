@@ -4,9 +4,10 @@
 
 #include "fused_hyperconnection.hpp"
 
+#include "device/fused_pre_post_device_operation.hpp"
+
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
-#include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/normalization/softmax/softmax.hpp"
 #include "ttnn/operations/reduction/generic/generic_reductions.hpp"
@@ -35,10 +36,12 @@ std::tuple<Tensor, Tensor, Tensor> fused_hyperconnection(
     const uint32_t d = static_cast<uint32_t>(shape[-1]);
     const uint32_t t = b * s;
 
-    // pre = sigmoid(pre_w * pre_scale + pre_bias) + eps.
-    Tensor pre = ttnn::add(ttnn::sigmoid(ttnn::add(ttnn::multiply(pre_w, pre_scale), pre_bias)), eps);
-    // post = 2 * sigmoid(post_w * post_scale + post_bias).
-    Tensor post = ttnn::multiply(ttnn::sigmoid(ttnn::add(ttnn::multiply(post_w, post_scale), post_bias)), 2.0f);
+    // Decode-only fused stage (T == 1):
+    //   post      = 2 * sigmoid(post_w * post_scale + post_bias)            [1,1,1,H]
+    //   collapsed = (sigmoid(pre_w * pre_scale + pre_bias) + eps) @ hidden  [1,1,1,D]
+    // The pre-weighted stream collapse is fused into the device op as a [1,H] x [H,D] matmul.
+    auto [post, collapsed] = ttnn::prim::fused_hyperconnection_pre_post(
+        pre_w, post_w, pre_bias, post_bias, hidden_streams, pre_scale, post_scale, eps, memory_config);
 
     // comb logits -> [1,T,H,H]; softmax over last dim, then Sinkhorn (alternate row/col
     // normalisation) onto the doubly-stochastic manifold.
@@ -50,11 +53,6 @@ std::tuple<Tensor, Tensor, Tensor> fused_hyperconnection(
         comb = ttnn::divide(comb, ttnn::add(ttnn::sum(comb, /*dim=*/-1, /*keepdim=*/true), eps));  // row
         comb = ttnn::divide(comb, ttnn::add(ttnn::sum(comb, /*dim=*/-2, /*keepdim=*/true), eps));  // column
     }
-
-    // collapsed = sum_h pre[..,h] * hidden_streams[..,h,:]  (weighted stream sum).
-    Tensor hs = ttnn::reshape(hidden_streams, ttnn::Shape({1, t, hc, d}));
-    Tensor pre_col = ttnn::reshape(pre, ttnn::Shape({1, t, hc, 1}));
-    Tensor collapsed = ttnn::sum(ttnn::multiply(hs, pre_col), /*dim=*/-2, /*keepdim=*/true);  // [1,T,1,D]
 
     post = ttnn::reshape(post, ttnn::Shape({b, s, hc, 1}));
     comb = ttnn::reshape(comb, ttnn::Shape({b, s, hc, hc}));
